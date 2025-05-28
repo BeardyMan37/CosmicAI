@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from numba import njit, prange
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
@@ -61,92 +62,97 @@ def load_data_by_length(path: str
     return df, result
 
 
+def precompute_kernel(L: int, w: float) -> np.ndarray:
+    idx = np.arange(L)
+    D = np.abs(np.subtract.outer(idx, idx))
+    return np.exp(-(D * D) / (w * w))
 
-def calculate_nwkr_sra(array: np.ndarray, w: float = 5.0) -> float:
-    """Compute the leave-one-out NWKR sum of squared residuals (Gaussian kernel)."""
-    indices = np.arange(len(array))
-    residuals = []
-    for idx in range(len(array)):
-        weights = np.exp(-((idx - indices) ** 2) / (w ** 2))
-        pred = np.sum(weights * array[indices]) / np.sum(weights)
-        residuals.append(array[idx] - pred)
-    return np.sum(np.array(residuals) ** 2)
+@njit(parallel=True)
+def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> float:
+    n = array.shape[0]
+    numer = np.empty(n, dtype=array.dtype)
+    denom = np.empty(n, dtype=array.dtype)
+    for i in prange(n):
+        s_num = 0.0
+        s_den = 0.0
+        for j in range(n):
+            w_ij = W[i, j]
+            s_num += w_ij * array[j]
+            s_den += w_ij
+        numer[i] = s_num
+        denom[i] = s_den
+    ssr = 0.0
+    for i in prange(n):
+        pred = numer[i] / denom[i] if denom[i] != 0.0 else 0.0
+        diff = array[i] - pred
+        ssr += diff * diff
+    return ssr
 
+@njit(parallel=True)
+def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray) -> float:
+    ssr = 0.0
+    m = idxs.shape[0]
+    for ii in prange(m):
+        i0 = idxs[ii]
+        num = 0.0
+        den = 0.0
+        for jj in range(m):
+            j0 = idxs[jj]
+            w_ij = W[i0, j0]
+            num += w_ij * array[j0]
+            den += w_ij
+        pred = num / den if den != 0.0 else 0.0
+        diff = array[i0] - pred
+        ssr += diff * diff
+    return ssr
 
-def score_variance_nwkr(array: np.ndarray, a: int, b: int, w: float = 5.0) -> float:
-    """Compute -SSR for inside [a,b] and outside regions using Gaussian NWKR."""
-    n = len(array)
-    idx_all = np.arange(n)
-    inside = idx_all[a:b+1]
-    outside = np.concatenate([idx_all[:a], idx_all[b+1:]])
-    
-    def ssr_region(idxs):
-        if idxs.size == 0:
-            return 0.0
-        D = np.abs(np.subtract.outer(idxs, idxs))
-        W = np.exp(-(D * D) / (w * w))
-        sums = W.sum(axis=1)
-        preds = np.einsum('ij,j->i', W, array[idxs]) / sums
-        diff = array[idxs] - preds
-        return np.sum(diff * diff)
-    
-    sri = ssr_region(inside)
-    sro = ssr_region(outside)
+def score_variance_nwkr(array: np.ndarray, a: int, b: int, W: np.ndarray) -> float:
+    n = array.shape[0]
+    inside  = np.arange(a, b+1)
+    outside = np.concatenate((np.arange(0, a), np.arange(b+1, n)))
+    sri = ssr_region(array, inside,  W)
+    sro = ssr_region(array, outside, W)
     return -(sri + sro)
 
-
 def _scan_row(params):
-    """Worker function: scan one row, find best (i,j), return its score and window."""
-    idx, row, score_fn, range_cap, buffer, w = params
-    n = len(row)
+    idx, row, range_cap, buffer, W = params
+    n = row.shape[0]
     best_score = -np.inf
     best_window = (0, 0)
-    
-    sra = calculate_nwkr_sra(row, w) if score_fn is score_variance_nwkr else None
-
-    start, end = buffer, n - buffer - 1
-    for i in range(start, end):
+    sra = calculate_nwkr_sra(row, W)
+    for i in range(buffer, n - buffer):
         max_j = min(i + range_cap + 1, n - buffer)
         for j in range(i + 1, max_j):
-            sc = score_fn(row, i, j, w)
-            if sra is not None:
-                sc = sc / sra + 1
+            sc = score_variance_nwkr(row, i, j, W)
+            sc = sc / sra + 1
             if sc > best_score:
-                best_score = sc
-                best_window = (i, j)
+                best_score, best_window = sc, (i, j)
     return idx, best_window, best_score
-
 
 def polynomial_scan_ranges_parallel(
     spec_arrays: np.ndarray,
     score_fn,
     range_cap: int = 20,
-    buffer: int = 10,
-    w: float = 5.0
+    buffer: int    = 10,
+    w: float       = 5.0
 ):
-    """
-    Parallel scan over each row of spec_arrays using score_fn.
-    Returns lists of best windows and scores.
-    """
-    n_rows = spec_arrays.shape[0]
+    n_rows, L = spec_arrays.shape
+    W = precompute_kernel(L, w)
+
     params = [
-        (i, spec_arrays[i], score_fn, range_cap, buffer, w)
+        (i, spec_arrays[i], range_cap, buffer, W)
         for i in range(n_rows)
     ]
-    
-    start = time.perf_counter()
+
     results = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as exe:
+    with ProcessPoolExecutor() as exe:
         futures = [exe.submit(_scan_row, p) for p in params]
-        for f in tqdm(as_completed(futures), total=n_rows, desc="Rows"):
+        for f in as_completed(futures):
             results.append(f.result())
-    duration = time.perf_counter() - start
-    
+
     results.sort(key=lambda x: x[0])
-    windows = [res[1] for res in results]
-    scores = [res[2] for res in results]
-    
-    print(f"Parallel scan completed in {duration:.2f}s")
+    windows = [r[1] for r in results]
+    scores  = [r[2] for r in results]
     return windows, scores
 
 
@@ -238,9 +244,6 @@ def main():
     print(f"Found lengths: {sorted(groups.keys())}")
 
     for length in sorted(groups):
-        if length > 256:
-            break
-
         specs, uid, ref, ant, pol, freqs = groups[length]
         n_rows, row_len = specs.shape
         print(f"\nLength={length}: {n_rows} rows, {row_len} channels")
