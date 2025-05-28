@@ -62,18 +62,6 @@ def load_data_by_length(path: str
     return df, result
 
 
-def find_boundaries(row, win=10, tau=1.0):
-    L = len(row)
-    S = []
-    for s in range(win, L - win):
-        Lseg = row[s-win:s]
-        Rseg = row[s:s+win]
-        num = abs(Lseg.mean() - Rseg.mean())
-        den = Lseg.var() + Rseg.var()
-        if den > 0 and num / den > tau:
-            S.append(s)
-    return S
-
 def precompute_kernel(L: int, w: float) -> np.ndarray:
     idx = np.arange(L)
     D = np.abs(np.subtract.outer(idx, idx))
@@ -118,35 +106,30 @@ def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray) -> float:
         ssr += diff * diff
     return ssr
 
-def score_variance_nwkr(array: np.ndarray, a: int, b: int, W: np.ndarray) -> float:
+def score_variance_nwkr(array: np.ndarray, a: int, b: int, range_cap: int, W: np.ndarray) -> float:
     n = array.shape[0]
-    inside  = np.arange(a, b+1)
-    outside = np.concatenate((np.arange(0, a), np.arange(b+1, n)))
+    inside  = np.arange(a, b + 1)
+    outside = np.concatenate([
+        np.arange(max(0, a - range_cap), a),
+        np.arange(b + 1, min(n, b + 1 + range_cap))
+    ])
     sri = ssr_region(array, inside,  W)
     sro = ssr_region(array, outside, W)
     return -(sri + sro)
 
 def _scan_row(params):
-    idx, row, range_cap, buffer, W, tau = params
-
-    B = find_boundaries(row, win=10, tau=tau)
-
-    if not B:
-        print("Defaulting...")
-        B = list(range(buffer, len(row)-buffer))
-
+    idx, row, range_cap, buffer, W = params
+    n = row.shape[0]
     best_score = -np.inf
     best_window = (0, 0)
     sra = calculate_nwkr_sra(row, W)
-
-    for i, s1 in enumerate(B):
-        for s2 in B[i+1:]:
-            if s2 - s1 > range_cap:
-                break
-            sc = score_variance_nwkr(row, s1, s2, W) / sra + 1
+    for i in range(buffer, n - buffer):
+        max_j = min(i + range_cap + 1, n - buffer)
+        for j in range(i + 1, max_j):
+            sc = score_variance_nwkr(row, i, j, range_cap, W)
+            sc = sc / sra + 1
             if sc > best_score:
-                best_score, best_window = sc, (s1, s2)
-
+                best_score, best_window = sc, (i, j)
     return idx, best_window, best_score
 
 def polynomial_scan_ranges_parallel(
@@ -154,14 +137,13 @@ def polynomial_scan_ranges_parallel(
     score_fn,
     range_cap: int = 20,
     buffer: int    = 10,
-    w: float       = 5.0,
-    tau: float     = 1.0,
+    w: float       = 5.0
 ):
     n_rows, L = spec_arrays.shape
     W = precompute_kernel(L, w)
 
     params = [
-        (i, spec_arrays[i], range_cap, buffer, W, tau)
+        (i, spec_arrays[i], range_cap, buffer, W)
         for i in range(n_rows)
     ]
 
@@ -212,7 +194,7 @@ def plot_top_k(
 
     sub_df.insert(0, "uid", sub_df.pop("uid"))
 
-    sub_df.to_csv(os.path.join(data_dir, 'bandpass_filtered.csv'), index=False)
+    sub_df.to_csv(os.path.join(data_dir, "bandpass_filtered.csv"), index=False)
 
     n_figs = math.ceil(k / per_fig)
     for fig_i in range(n_figs):
@@ -255,7 +237,6 @@ def main():
     RANGE_CAP = 20
     BUFFER    = 10
     W         = 3
-    tau       = 5
     TOP_K     = 100
     PER_FIG   = 10
 
@@ -278,8 +259,7 @@ def main():
             score_variance_nwkr,
             range_cap=RANGE_CAP,
             buffer=BUFFER,
-            w=W,
-            tau=tau
+            w=W
         )
         t3 = time.perf_counter()
         print(f"  Scan time: {t3-t2:.3f}s")
