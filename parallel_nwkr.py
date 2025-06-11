@@ -20,6 +20,8 @@ def load_data_by_length(path: str
     """Load spectrograms + metadata, group by the length of each spectrum."""
     if path.endswith('.csv'):
         df = pd.read_csv(path, sep='|', dtype=str, header=0)
+        df['uid'] = df.index
+        df = df.reset_index(drop=True)
         specs = [np.array(ast.literal_eval(s), dtype=float)
                  for s in df['spec_arrays']]
         freqs = [np.array(ast.literal_eval(s), dtype=float)
@@ -82,39 +84,51 @@ def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> float:
         numer[i] = s_num
         denom[i] = s_den
     ssr = 0.0
+    ssr_array = np.empty(n, dtype=array.dtype)
     for i in prange(n):
         pred = numer[i] / denom[i] if denom[i] != 0.0 else 0.0
         diff = array[i] - pred
-        ssr += diff * diff
-    return ssr
+        ssr_array[i] = diff * diff
+        ssr += ssr_array[i]
+    return ssr, ssr_array
 
 @njit(parallel=True)
-def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray) -> float:
+def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray, sign: str, ssr_array: np.ndarray, a: int, b: int, range_cap: int) -> float:
     ssr = 0.0
     m = idxs.shape[0]
     for ii in prange(m):
         i0 = idxs[ii]
         num = 0.0
         den = 0.0
-        for jj in range(m):
-            j0 = idxs[jj]
-            w_ij = W[i0, j0]
-            num += w_ij * array[j0]
-            den += w_ij
-        pred = num / den if den != 0.0 else 0.0
-        diff = array[i0] - pred
-        ssr += diff * diff
+        if sign == 'in':
+            for jj in range(m):
+                j0 = idxs[jj]
+                w_ij = W[i0, j0]
+                num += w_ij * array[j0]
+                den += w_ij
+            pred = num / den if den != 0.0 else 0.0
+            diff = array[i0] - pred
+            ssr += diff * diff
+        elif sign == 'out':
+            if i0 < (a - 2 * range_cap) or i0 > (b + 1 + 2 * range_cap):
+                ssr += ssr_array[i0]
+            else:
+                for jj in range(m):
+                    j0 = idxs[jj]
+                    w_ij = W[i0, j0]
+                    num += w_ij * array[j0]
+                    den += w_ij
+                pred = num / den if den != 0.0 else 0.0
+                diff = array[i0] - pred
+                ssr += diff * diff
     return ssr
 
-def score_variance_nwkr(array: np.ndarray, a: int, b: int, range_cap: int, W: np.ndarray) -> float:
+def score_variance_nwkr(array: np.ndarray, a: int, b: int, range_cap: int, W: np.ndarray, ssr_array: np.ndarray) -> float:
     n = array.shape[0]
     inside  = np.arange(a, b + 1)
-    outside = np.concatenate([
-        np.arange(max(0, a - range_cap), a),
-        np.arange(b + 1, min(n, b + 1 + range_cap))
-    ])
-    sri = ssr_region(array, inside,  W)
-    sro = ssr_region(array, outside, W)
+    outside = np.concatenate([np.arange(0, a), np.arange(b + 1, n)])
+    sri = ssr_region(array, inside,  W, 'in', ssr_array, a, b, range_cap)
+    sro = ssr_region(array, outside, W, 'out', ssr_array, a, b, range_cap)
     return -(sri + sro)
 
 def _scan_row(params):
@@ -122,11 +136,11 @@ def _scan_row(params):
     n = row.shape[0]
     best_score = -np.inf
     best_window = (0, 0)
-    sra = calculate_nwkr_sra(row, W)
+    sra, ssr_array = calculate_nwkr_sra(row, W)
     for i in range(buffer, n - buffer):
         max_j = min(i + range_cap + 1, n - buffer)
         for j in range(i + 1, max_j):
-            sc = score_variance_nwkr(row, i, j, range_cap, W)
+            sc = score_variance_nwkr(row, i, j, range_cap, W, ssr_array)
             sc = sc / sra + 1
             if sc > best_score:
                 best_score, best_window = sc, (i, j)
@@ -169,6 +183,7 @@ def plot_top_k(
     sra_w: int = 5,
     k: int = 10,
     per_fig: int = 10,
+    buffer: int = 10,
     out_dir: str = "Images",
     data_dir: str = "Data",
 ):
@@ -212,9 +227,13 @@ def plot_top_k(
         for ax, idx in zip(axes, sub_top):
             row = spec_arrays[idx]
             a, b = windows[idx]
-            x = np.arange(len(row))
+            n = len(row)
+            x = np.arange(n)
 
             ax.plot(x, row, color='C0')
+            if buffer > 0:
+                ax.axvspan(0, buffer - 1, color='gray', alpha=0.2)
+                ax.axvspan(n - buffer, n - 1, color='gray', alpha=0.2)
             ax.axvspan(a, b, color='C1', alpha=0.3)
             ax.set_title(
                 f"Uid={meta['uid'][idx]}, Score={scores[idx]:.2f}, "
@@ -234,9 +253,8 @@ def plot_top_k(
 
 def main():
     CSV_PATH = "Data/bandpass_qa0_no_partitions.parquet"
-    RANGE_CAP = 20
-    BUFFER    = 10
     W         = 3
+    RANGE_CAP = 3 * W
     TOP_K     = 100
     PER_FIG   = 10
 
@@ -247,6 +265,7 @@ def main():
     print(f"Found lengths: {sorted(groups.keys())}")
 
     for length in sorted(groups):
+        BUFFER = length // 20
         specs, uid, ref, ant, pol, freqs = groups[length]
         n_rows, row_len = specs.shape
         print(f"\nLength={length}: {n_rows} rows, {row_len} channels")
@@ -280,6 +299,7 @@ def main():
             sra_w=W,
             k=min(TOP_K, n_rows),
             per_fig=PER_FIG,
+            buffer=BUFFER,
             out_dir=out_dir,
             data_dir=data_dir,
         )
