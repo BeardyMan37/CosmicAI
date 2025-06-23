@@ -69,6 +69,12 @@ def precompute_kernel(L: int, w: float) -> np.ndarray:
     D = np.abs(np.subtract.outer(idx, idx))
     return np.exp(-(D * D) / (w * w))
 
+def precompute_trunc_kernel(w: int) -> Tuple[np.ndarray,int]:
+    half = 3 * w
+    d = np.arange(-half, half+1, dtype=float)
+    k1d = np.exp(-(d*d) / (w*w))
+    return k1d, half
+
 @njit(parallel=True)
 def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> float:
     n = array.shape[0]
@@ -90,6 +96,28 @@ def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> float:
         diff = array[i] - pred
         ssr_array[i] = diff * diff
         ssr += ssr_array[i]
+    return ssr, ssr_array
+
+@njit
+def calculate_nwkr_sra_trunc(array: np.ndarray, k1d: np.ndarray, half: int) -> Tuple[float, np.ndarray]:
+    n = array.shape[0]
+    numer = np.empty(n, dtype=array.dtype)
+    denom = np.empty(n, dtype=array.dtype)
+
+    for i in prange(n):
+        j0 = max(0, i - half)
+        j1 = min(n, i + half + 1)
+
+        ds = np.arange(j0, j1) - i
+        weights = k1d[ds + half]
+
+        numer[i] = np.dot(weights, array[j0:j1])
+        denom[i] = weights.sum()
+
+    preds     = numer / denom
+    ssr_array = (array - preds)**2
+    ssr       = ssr_array.sum()
+
     return ssr, ssr_array
 
 @njit(parallel=True)
@@ -123,6 +151,31 @@ def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray, sign: str, ss
                 ssr += diff * diff
     return ssr
 
+@njit
+def ssr_region_trunc(
+    array: np.ndarray,
+    idxs: np.ndarray,
+    k1d: np.ndarray,
+    half: int
+) -> float:
+    ssr = 0.0
+    n = array.shape[0]
+    for ii in range(idxs.shape[0]):
+        i = idxs[ii]
+        j0 = max(0, i - half)
+        j1 = min(n, i + half + 1)
+        ds = np.arange(j0, j1) - i
+        w = k1d[ds + half]
+        segment = array[j0:j1]
+        s = w.sum()
+        if s > 0.0:
+            pred = np.dot(w, segment) / s
+        else:
+            pred = 0.0
+        diff = array[i] - pred
+        ssr += diff*diff
+    return ssr
+
 def score_variance_nwkr(array: np.ndarray, a: int, b: int, range_cap: int, W: np.ndarray, ssr_array: np.ndarray) -> float:
     n = array.shape[0]
     inside  = np.arange(a, b + 1)
@@ -131,16 +184,40 @@ def score_variance_nwkr(array: np.ndarray, a: int, b: int, range_cap: int, W: np
     sro = ssr_region(array, outside, W, 'out', ssr_array, a, b, range_cap)
     return -(sri + sro)
 
+def score_variance_nwkr_trunc(
+    array: np.ndarray,
+    a: int, b: int,
+    range_cap: int,
+    k1d: np.ndarray,
+    half: int,
+    ssr_array: np.ndarray
+) -> float:
+    n = array.shape[0]
+    inside  = np.arange(a, b+1)
+    outside = np.concatenate([
+        np.arange(max(0, a-range_cap), a),
+        np.arange(b+1, min(n, b+1+range_cap))
+    ])
+
+    sri = ssr_region_trunc(array, inside,  k1d, half)
+    sro = ssr_region_trunc(array, outside, k1d, half)
+    return -(sri + sro)
+
 def _scan_row(params):
-    idx, row, range_cap, buffer, W = params
+    # idx, row, range_cap, buffer, W = params
+    idx, row, range_cap, buffer, k1d, half = params
     n = row.shape[0]
     best_score = -np.inf
     best_window = (0, 0)
-    sra, ssr_array = calculate_nwkr_sra(row, W)
+    # sra, ssr_array = calculate_nwkr_sra(row, W)
+    sra, ssr_array = calculate_nwkr_sra_trunc(row, k1d, half)
     for i in range(buffer, n - buffer):
         max_j = min(i + range_cap + 1, n - buffer)
         for j in range(i + 1, max_j):
-            sc = score_variance_nwkr(row, i, j, range_cap, W, ssr_array)
+            # sc = score_variance_nwkr(row, i, j, range_cap, W, ssr_array)
+            sc = score_variance_nwkr_trunc(
+                row, i, j, range_cap, k1d, half, ssr_array
+            )
             sc = sc / sra + 1
             if sc > best_score:
                 best_score, best_window = sc, (i, j)
@@ -154,10 +231,15 @@ def polynomial_scan_ranges_parallel(
     w: float       = 5.0
 ):
     n_rows, L = spec_arrays.shape
-    W = precompute_kernel(L, w)
+    # W = precompute_kernel(L, w)
+    k1d, half = precompute_trunc_kernel(w)
 
+    # params = [
+    #     (i, spec_arrays[i], range_cap, buffer, W)
+    #     for i in range(n_rows)
+    # ]
     params = [
-        (i, spec_arrays[i], range_cap, buffer, W)
+        (i, spec_arrays[i], range_cap, buffer, k1d, half)
         for i in range(n_rows)
     ]
 
@@ -252,7 +334,7 @@ def plot_top_k(
 
 
 def main():
-    CSV_PATH = "Data/bandpass_qa0_no_partitions.parquet"
+    CSV_PATH = "Data/bandpass_example.csv"
     W         = 3
     RANGE_CAP = 3 * W
     TOP_K     = 100
