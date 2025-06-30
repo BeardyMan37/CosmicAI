@@ -173,7 +173,7 @@ def polynomial_scan_ranges_parallel(
     return windows, scores
 
 
-def plot_top_k(
+def  plot_top_k(
     df: pd.DataFrame,
     spec_arrays: np.ndarray,
     windows: list,
@@ -237,9 +237,10 @@ def plot_top_k(
             ax.axvspan(a, b, color='C1', alpha=0.3)
             ax.set_title(
                 f"Uid={meta['uid'][idx]}, Score={scores[idx]:.2f}, "
+                f"Range={a},{b}, "
                 f"Ref={meta['ref'][idx]}, Ant={meta['ant'][idx]}, "
                 f"Pol={meta['pol'][idx]}, "
-                f"Freq={meta['freq'][idx][a]:.0f}-{meta['freq'][idx][b]:.0f}"
+                f"Freq={meta['freq'][idx][a]:.2e}-{meta['freq'][idx][b]:.2e}"
             )
             ax.set_xlabel("Channel")
             ax.set_ylabel("Amplitude")
@@ -251,12 +252,22 @@ def plot_top_k(
         plt.close(fig)
 
 
+def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
+    n_rows, n_ch = specs.shape
+    n_blk = n_ch // factor
+    trimmed = specs[:, :n_blk * factor]
+    return trimmed.reshape(n_rows, n_blk, factor).mean(axis=2)
+
+
 def main():
-    CSV_PATH = "Data/bandpass_qa0_no_partitions.parquet"
+    CSV_PATH = "Data/bandpass_example.csv"
     W         = 3
     RANGE_CAP = 3 * W
     TOP_K     = 100
     PER_FIG   = 10
+    BUFFER_COEFF = 20
+    SR_FACTOR = 2
+
 
     t0 = time.perf_counter()
     df, groups = load_data_by_length(CSV_PATH)
@@ -265,19 +276,25 @@ def main():
     print(f"Found lengths: {sorted(groups.keys())}")
 
     for length in sorted(groups):
-        BUFFER = length // 20
+        BUFFER = length // BUFFER_COEFF
         specs, uid, ref, ant, pol, freqs = groups[length]
         n_rows, row_len = specs.shape
-        print(f"\nLength={length}: {n_rows} rows, {row_len} channels")
+        print(f"\nBefore Preprocessing: Length={length}: {n_rows} rows, {row_len} channels")
+
+        specs_sr = superresolve(specs, factor=SR_FACTOR)
+
+        n_rows, row_len = specs_sr.shape
+        print(f"\nAfter Preprocessing: Length={length}: {n_rows} rows, {row_len} channels")
+
 
         meta = {'uid': uid, 'ref': ref, 'ant': ant, 'pol': pol, 'freq': freqs}
 
         t2 = time.perf_counter()
-        windows, scores = polynomial_scan_ranges_parallel(
-            specs,
+        windows_sr, scores = polynomial_scan_ranges_parallel(
+            specs_sr,
             score_variance_nwkr,
             range_cap=RANGE_CAP,
-            buffer=BUFFER,
+            buffer=BUFFER // SR_FACTOR,
             w=W
         )
         t3 = time.perf_counter()
@@ -289,6 +306,8 @@ def main():
         data_dir = os.path.join("Data", f"length_{length}")
         os.makedirs(data_dir, exist_ok=True)
 
+        windows = [(i * SR_FACTOR, (j + 1) * SR_FACTOR - 1) for i, j in windows_sr]
+
         plot_top_k(
             df=df,
             spec_arrays=specs,
@@ -299,7 +318,7 @@ def main():
             sra_w=W,
             k=min(TOP_K, n_rows),
             per_fig=PER_FIG,
-            buffer=BUFFER,
+            buffer=BUFFER // SR_FACTOR,
             out_dir=out_dir,
             data_dir=data_dir,
         )
