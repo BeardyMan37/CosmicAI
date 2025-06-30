@@ -260,13 +260,12 @@ def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
 
 
 def main():
-    CSV_PATH = "Data/bandpass_example.csv"
+    CSV_PATH = "Data/bandpass_qa0_no_partitions.parquet"
     W         = 3
     RANGE_CAP = 3 * W
-    TOP_K     = 100
+    TOP_K     = 1000
     PER_FIG   = 10
     BUFFER_COEFF = 20
-    SR_FACTOR = 2
 
 
     t0 = time.perf_counter()
@@ -276,6 +275,10 @@ def main():
     print(f"Found lengths: {sorted(groups.keys())}")
 
     for length in sorted(groups):
+        if length < 100:
+            SR_FACTOR = 2 ** 0
+        else:
+            SR_FACTOR = 2 ** max(1, length // 1000)
         BUFFER = length // BUFFER_COEFF
         specs, uid, ref, ant, pol, freqs = groups[length]
         n_rows, row_len = specs.shape
@@ -284,7 +287,7 @@ def main():
         specs_sr = superresolve(specs, factor=SR_FACTOR)
 
         n_rows, row_len = specs_sr.shape
-        print(f"\nAfter Preprocessing: Length={length}: {n_rows} rows, {row_len} channels")
+        print(f"\nAfter Preprocessing: Length={length}: {n_rows} rows, {row_len} channels, SR_factor {SR_FACTOR}")
 
 
         meta = {'uid': uid, 'ref': ref, 'ant': ant, 'pol': pol, 'freq': freqs}
