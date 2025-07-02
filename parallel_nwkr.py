@@ -15,31 +15,71 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, List
 
-def load_data_by_length(path: str
+
+def match_and_correct(
+    freq_array: np.ndarray,
+    amp_array: np.ndarray,
+    trans_freqs: np.ndarray,
+    trans_vals: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    idxs = np.searchsorted(trans_freqs, freq_array)
+    idxs[idxs == len(trans_freqs)] = len(trans_freqs) - 1
+    left  = np.maximum(idxs - 1, 0)
+    right = idxs
+    dl = np.abs(freq_array - trans_freqs[left])
+    dr = np.abs(trans_freqs[right] - freq_array)
+    nearest = np.where(dl <= dr, left, right)
+    mt = trans_vals[nearest]
+    frac = np.clip(mt / 100.0, 1e-6, None)
+    adjusted_amp = amp_array * frac
+    return mt, adjusted_amp
+
+def load_data_by_length(data_path: str, 
+                        interference_path: str
 ) -> Tuple[pd.DataFrame, Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]:
     """Load spectrograms + metadata, group by the length of each spectrum."""
-    if path.endswith('.csv'):
-        df = pd.read_csv(path, sep='|', dtype=str, header=0)
+    if data_path.endswith('.csv'):
+        df = pd.read_csv(data_path, sep='|', dtype=str, header=0)
         df['uid'] = df.index
         df = df.reset_index(drop=True)
-        specs = [np.array(ast.literal_eval(s), dtype=float)
+        actual_specs = [np.array(ast.literal_eval(s), dtype=float)
                  for s in df['spec_arrays']]
         freqs = [np.array(ast.literal_eval(s), dtype=float)
                  for s in df['frequency_array']]
-    elif path.endswith('.parquet'):
-        df = pd.read_parquet(path)
+    elif data_path.endswith('.parquet'):
+        df = pd.read_parquet(data_path)
         df['uid'] = df.index
         df = df.reset_index(drop=True)
-        specs = [np.array(x, dtype=float)
+        df['frequency_array'] = df['frequency_array'].apply(lambda freqs: [f/1e9 for f in freqs])
+        trans_df = pd.read_parquet(interference_path)
+        trans_freqs = trans_df['Frequency (GHz)'].values
+        trans_vals  = trans_df['Transmission (%)'].values
+        
+        results = df.apply(
+            lambda row: match_and_correct(
+                np.array(row['frequency_array'], dtype=float),
+                np.array(row['amplitude_corr_tsys'], dtype=float),
+                trans_freqs,
+                trans_vals
+            ),
+            axis=1
+        )
+
+        df['transmission_array'], df['adjusted_amplitude_corr_tsys'] = zip(*results)
+        actual_specs = [np.array(x, dtype=float)
                  for x in df['amplitude_corr_tsys'].tolist()]
         freqs = [np.array(x, dtype=float)
                  for x in df['frequency_array'].tolist()]
+        adjusted_specs = [np.array(x, dtype=float)
+                 for x in df['adjusted_amplitude_corr_tsys'].tolist()]
+        
     else:
-        raise ValueError(f"Unsupported extension: {path!r}")
+        raise ValueError(f"Unsupported extension: {data_path!r}")
 
-    keep = [not np.all(s == 0.0) for s in specs]
-    specs = [s for s,k in zip(specs, keep) if k]
+    keep = [not np.all(s == 0.0) for s in actual_specs]
+    actual_specs = [s for s,k in zip(actual_specs, keep) if k]
     freqs = [f for f,k in zip(freqs, keep) if k]
+    adjusted_specs = [s for s,k in zip(adjusted_specs, keep) if k]
 
     uid = df['uid'].values[keep]
     ref = df['ref_antenna_name'].values[keep]
@@ -47,19 +87,20 @@ def load_data_by_length(path: str
     pol = df['polarization'].values[keep]
 
     length_groups: Dict[int, List[int]] = {}
-    for i, s in enumerate(specs):
+    for i, s in enumerate(actual_specs):
         L = s.shape[0]
         length_groups.setdefault(L, []).append(i)
 
     result: Dict[int, Tuple[np.ndarray, ...]] = {}
     for L, idxs in length_groups.items():
-        specs_L = np.vstack([specs[i] for i in idxs])
+        actual_specs_L = np.vstack([actual_specs[i] for i in idxs])
+        adjusted_specs_L = np.vstack([adjusted_specs[i] for i in idxs])
         freqs_L = np.vstack([freqs[i] for i in idxs])
         uid_L   = uid[idxs]
         ref_L   = ref[idxs]
         ant_L   = ant[idxs]
         pol_L   = pol[idxs]
-        result[L] = (specs_L, uid_L, ref_L, ant_L, pol_L, freqs_L)
+        result[L] = (actual_specs_L, uid_L, ref_L, ant_L, pol_L, freqs_L, adjusted_specs_L)
 
     return df, result
 
@@ -175,7 +216,8 @@ def polynomial_scan_ranges_parallel(
 
 def  plot_top_k(
     df: pd.DataFrame,
-    spec_arrays: np.ndarray,
+    actual_spec_arrays: np.ndarray,
+    adjusted_spec_arrays: np.ndarray,
     windows: list,
     scores: list,
     meta: dict,
@@ -225,12 +267,14 @@ def  plot_top_k(
             axes = [axes]
 
         for ax, idx in zip(axes, sub_top):
-            row = spec_arrays[idx]
+            actual_row   = actual_spec_arrays[idx]
+            adjusted_row = adjusted_spec_arrays[idx]
             a, b = windows[idx]
-            n = len(row)
+            n = len(actual_row)
             x = np.arange(n)
 
-            ax.plot(x, row, color='C0')
+            ax.plot(x, actual_row,   label="Actual",   color='C0')
+            ax.plot(x, adjusted_row, label="Adjusted", color='C2')
             if buffer > 0:
                 ax.axvspan(0, buffer - 1, color='gray', alpha=0.2)
                 ax.axvspan(n - buffer, n - 1, color='gray', alpha=0.2)
@@ -260,7 +304,8 @@ def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
 
 
 def main():
-    CSV_PATH = "Data/bandpass_qa0_no_partitions.parquet"
+    DATA_PATH = "Data/bandpass_qa0_no_partitions.parquet"
+    INTERFERENCE_PATH = "Data/full_spectrum.gzip"
     W         = 3
     RANGE_CAP = 3 * W
     TOP_K     = 1000
@@ -269,7 +314,7 @@ def main():
 
 
     t0 = time.perf_counter()
-    df, groups = load_data_by_length(CSV_PATH)
+    df, groups = load_data_by_length(DATA_PATH, INTERFERENCE_PATH)
     t1 = time.perf_counter()
     print(f"Loaded & grouped data in {t1-t0:.3f}s")
     print(f"Found lengths: {sorted(groups.keys())}")
@@ -279,14 +324,15 @@ def main():
             SR_FACTOR = 2 ** 0
         else:
             SR_FACTOR = 2 ** max(1, length // 1000)
+            break
         BUFFER = length // BUFFER_COEFF
-        specs, uid, ref, ant, pol, freqs = groups[length]
-        n_rows, row_len = specs.shape
+        actual_specs, uid, ref, ant, pol, freqs, adjusted_specs = groups[length]
+        n_rows, row_len = actual_specs.shape
         print(f"\nBefore Preprocessing: Length={length}: {n_rows} rows, {row_len} channels")
 
-        specs_sr = superresolve(specs, factor=SR_FACTOR)
+        adjusted_specs_sr = superresolve(adjusted_specs, factor=SR_FACTOR)
 
-        n_rows, row_len = specs_sr.shape
+        n_rows, row_len = adjusted_specs_sr.shape
         print(f"\nAfter Preprocessing: Length={length}: {n_rows} rows, {row_len} channels, SR_factor {SR_FACTOR}")
 
 
@@ -294,7 +340,7 @@ def main():
 
         t2 = time.perf_counter()
         windows_sr, scores = polynomial_scan_ranges_parallel(
-            specs_sr,
+            adjusted_specs_sr,
             score_variance_nwkr,
             range_cap=RANGE_CAP,
             buffer=BUFFER // SR_FACTOR,
@@ -313,7 +359,8 @@ def main():
 
         plot_top_k(
             df=df,
-            spec_arrays=specs,
+            actual_spec_arrays=actual_specs,
+            adjusted_spec_arrays=adjusted_specs,
             windows=windows,
             scores=scores,
             meta=meta,
