@@ -207,14 +207,15 @@ def _scan_row(params):
         skip_range = []
         for idx in range(len(ignore)):
             start, end = ignore[idx][0], ignore[idx][1]
-            skip_range.append(list(range(start, end + 1)))
+            skip_range.extend(list(range(start, end + 1)))
         indices = list(filter(lambda item: item not in skip_range, original_indices))
     for idx, i in enumerate(indices):
         max_j = min(indices[min(idx + range_cap + 1, len(indices) - 1)], n - buffer)
-        for j in indices[idx + 1: max_j]:
+        sliced_indices = indices[idx + 1: max_j]
+        for j in sliced_indices:
             inside_list = indices[i: j]
             outside_list = list(filter(lambda item: item not in inside_list, indices))
-            sc = score_variance_nwkr(row, np.asarray(inside_list), np.asarray(outside_list), i, j, range_cap, W, ssr_array)
+            sc = score_variance_nwkr(row, np.asarray(inside_list, dtype=np.int64), np.asarray(outside_list, dtype=np.int64), i, j, range_cap, W, ssr_array)
             sc = sc / sra + 1
             if sc > best_score:
                 best_score, best_window = sc, (i, j)
@@ -312,7 +313,7 @@ def  plot_top_k(
             if len(atm_interf) != 0:
                 for idx in range(len(atm_interf)):
                     c, d = atm_interf[idx][0], atm_interf[idx][1]
-                    ax.axvspan(c, d, color='D5',  alpha=0.2)
+                    ax.axvspan(c, d, color='C9',  alpha=0.2)
 
             ax.plot(x, actual_row,   label="Actual",   color='C0')
             # ax.plot(x, adjusted_row, label="Adjusted", color='C2')
