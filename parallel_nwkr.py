@@ -41,10 +41,54 @@ def load_data_by_length(data_path: str,
         df = pd.read_csv(data_path, sep='|', dtype=str, header=0)
         df['uid'] = df.index
         df = df.reset_index(drop=True)
+        df['frequency_array'] = df['frequency_array'].apply(lambda s: np.array(ast.literal_eval(s), dtype=float))
+        df['frequency_array'] = df['frequency_array'].apply(lambda freqs: [f/1e9 for f in freqs])
+        trans_df = pd.read_parquet(interference_path)
+        trans_freqs = trans_df['Frequency (GHz)'].values
+        trans_vals  = trans_df['Transmission (%)'].values
+        
+        results = df.apply(
+            lambda row: match_and_correct(
+                np.array(row['frequency_array'], dtype=float),
+                trans_freqs,
+                trans_vals
+            ),
+            axis=1
+        )
+
+        df['transmission_array'] = results
+        
+        interference = []
+        for index in df.index:
+            freqs = np.array(df.loc[index, 'frequency_array'], dtype=float)
+            trans = np.array(df.loc[index, 'transmission_array'], dtype=float)
+
+            troguhs, props = find_peaks(-trans, prominence=1)
+            _, _, left_ips, right_ips = peak_widths(-trans, troguhs, rel_height=0.75)
+
+            left_freqs  = np.interp(left_ips,  np.arange(len(freqs)), freqs)
+            right_freqs = np.interp(right_ips, np.arange(len(freqs)), freqs)
+            widths_freq = right_freqs - left_freqs
+
+            trough_freqs  = freqs[troguhs]
+            trough_ranges = []
+            for i in range(len(trough_freqs)):
+                trough_ranges.append((trough_freqs[i] - widths_freq[i] / 2, trough_freqs[i] + widths_freq[i] / 2))
+            trough_ranges = np.array(trough_ranges)
+
+            closest_idxs = []
+            for troguhs_range in trough_ranges:
+                start, end = troguhs_range[0], troguhs_range[1]
+                closest_start_idx = int(np.abs(freqs - start).argmin())
+                closest_end_idx = int(np.abs(freqs - end).argmin())
+                closest_idxs.append((closest_start_idx, closest_end_idx))
+            interference.append(closest_idxs)
+
+        df['atmospheric_interference'] = interference
         actual_specs = [np.array(ast.literal_eval(s), dtype=float)
                  for s in df['spec_arrays']]
-        freqs = [np.array(ast.literal_eval(s), dtype=float)
-                 for s in df['frequency_array']]
+        freqs = [np.array(x, dtype=float)
+                 for x in df['frequency_array'].tolist()]
     elif data_path.endswith('.parquet'):
         df = pd.read_parquet(data_path)
         df['uid'] = df.index
@@ -66,9 +110,9 @@ def load_data_by_length(data_path: str,
         df['transmission_array'] = results
         
         interference = []
-        for idx in df.index:
-            freqs = np.array(df.loc[idx, 'frequency_array'], dtype=float)
-            trans = np.array(df.loc[idx, 'transmission_array'], dtype=float)
+        for index in df.index:
+            freqs = np.array(df.loc[index, 'frequency_array'], dtype=float)
+            trans = np.array(df.loc[index, 'transmission_array'], dtype=float)
 
             troguhs, props = find_peaks(-trans, prominence=1)
             _, _, left_ips, right_ips = peak_widths(-trans, troguhs, rel_height=0.75)
@@ -130,8 +174,8 @@ def load_data_by_length(data_path: str,
 
 
 def precompute_kernel(L: int, w: float) -> np.ndarray:
-    idx = np.arange(L)
-    D = np.abs(np.subtract.outer(idx, idx))
+    index = np.arange(L)
+    D = np.abs(np.subtract.outer(index, index))
     return np.exp(-(D * D) / (w * w))
 
 @njit(parallel=True)
@@ -195,31 +239,43 @@ def score_variance_nwkr(array: np.ndarray, inside: np.ndarray, outside: np.ndarr
     return -(sri + sro)
 
 def _scan_row(params):
-    idx, row, ignore, range_cap, buffer, W = params
+    row_idx, row, ignore, range_cap, buffer, W = params
     n = row.shape[0]
     best_score = -np.inf
     best_window = (0, 0)
     sra, ssr_array = calculate_nwkr_sra(row, W)
-    if len(ignore) == 0:
-        indices = range(buffer, n - buffer)
-    else:
-        original_indices = range(buffer, n - buffer)
-        skip_range = []
-        for idx in range(len(ignore)):
-            start, end = ignore[idx][0], ignore[idx][1]
-            skip_range.extend(list(range(start, end + 1)))
-        indices = list(filter(lambda item: item not in skip_range, original_indices))
-    for idx, i in enumerate(indices):
-        max_j = min(indices[min(idx + range_cap + 1, len(indices) - 1)], n - buffer)
-        sliced_indices = indices[idx + 1: max_j]
-        for j in sliced_indices:
-            inside_list = indices[i: j]
-            outside_list = list(filter(lambda item: item not in inside_list, indices))
-            sc = score_variance_nwkr(row, np.asarray(inside_list, dtype=np.int64), np.asarray(outside_list, dtype=np.int64), i, j, range_cap, W, ssr_array)
+
+    all_valid_ch = list(range(0, n))
+    all_ch = list(range(buffer, n - buffer))
+    
+    forbidden = set()
+    for (start, end) in ignore:
+        forbidden.update(range(start, end + 1))
+
+    indices = [ch for ch in all_ch if ch not in forbidden]
+    
+    for pos_i, i in enumerate(indices):
+        if pos_i < len(indices) - 1 and indices[pos_i + 1] - indices[pos_i] > 1:
+            continue
+        sub_indices = indices[pos_i + 1:]
+        for pos_j, j in enumerate(sub_indices):
+            if j > i + range_cap or sub_indices[pos_j] - sub_indices[pos_j - 1] > 1:
+                break
+
+            inside  = [ch for ch in indices if i <= ch <= j]
+            outside = [ch for ch in all_valid_ch if ch not in inside]
+            
+            sc = score_variance_nwkr(
+                row,
+                np.asarray(inside,  dtype=np.int64),
+                np.asarray(outside, dtype=np.int64),
+                i, j, range_cap, W, ssr_array
+            )
             sc = sc / sra + 1
+
             if sc > best_score:
                 best_score, best_window = sc, (i, j)
-    return idx, best_window, best_score
+    return row_idx, best_window, best_score
 
 def polynomial_scan_ranges_parallel(
     spec_arrays: np.ndarray,
@@ -249,10 +305,9 @@ def polynomial_scan_ranges_parallel(
     return windows, scores
 
 
-def  plot_top_k(
+def plot_top_k(
     df: pd.DataFrame,
     actual_spec_arrays: np.ndarray,
-    # adjusted_spec_arrays: np.ndarray,
     windows: list,
     atm_interfs:list,
     scores: list,
@@ -269,8 +324,9 @@ def  plot_top_k(
 
     scores_np = np.array(scores)
     finite = np.isfinite(scores_np)
-    idxs = np.where(finite)[0]
-    top = idxs[np.argsort(scores_np[finite])[-k:]][::-1]
+    indexes = np.where(finite)[0]
+    top = indexes[np.argsort(scores_np[finite])[-k:]][::-1]
+
     top_uids = np.array(meta['uid'])[top]
     top_scores = np.asarray(scores)[top]
     top_windows = np.asarray(windows)[top]
@@ -287,56 +343,71 @@ def  plot_top_k(
 
     sub_df.insert(0, "uid", sub_df.pop("uid"))
 
-    sub_df.to_csv(os.path.join(data_dir, "bandpass_filtered.csv"), index=False)
+    sub_df.to_csv(os.path.join(data_dir, "bandpass_qa0_no_partitions_labelled_filt_scan_stat.csv"), index=False)
+    
+    df_slice = df.iloc[top].copy()
 
-    n_figs = math.ceil(k / per_fig)
+    df_slice["orig_idx"] = top
+    df_slice["score"]    = scores_np[top]
+    df_slice["win_start"] = [windows[i][0] for i in top]
+    df_slice["win_end"]   = [windows[i][1] for i in top]
+
+    n_figs = math.ceil(len(df_slice) / per_fig)
     for fig_i in range(n_figs):
-        start = fig_i * per_fig
-        end = min(start + per_fig, k)
-        sub_top = top[start:end]
-        sub_k = len(sub_top)
-
-        fig, axes = plt.subplots(sub_k, 1, figsize=(10, 3 * sub_k))
-        fig.suptitle(f"Top {k} (items {start+1}–{end}), SR_w={sr_w}, SRA_w={sra_w}",
-                     fontsize=16)
-        if sub_k == 1:
+        chunk = df_slice.iloc[fig_i*per_fig:(fig_i+1)*per_fig]
+        fig_k = len(chunk)
+        fig, axes = plt.subplots(fig_k, 1, figsize=(10, 3*fig_k))
+        if fig_k == 1:
             axes = [axes]
 
-        for ax, idx in zip(axes, sub_top):
-            actual_row   = actual_spec_arrays[idx]
-            # adjusted_row = adjusted_spec_arrays[idx]
-            a, b = windows[idx]
-            n = len(actual_row)
-            x = np.arange(n)
+        for ax, row in zip(axes, chunk.itertuples()):
+            i0 = row.orig_idx
+            spec = actual_spec_arrays[i0]
+            a, b = row.win_start, row.win_end
 
-            atm_interf = atm_interfs[idx]
-            if len(atm_interf) != 0:
-                for idx in range(len(atm_interf)):
-                    c, d = atm_interf[idx][0], atm_interf[idx][1]
-                    ax.axvspan(c, d, color='C9',  alpha=0.2)
+            for (c,d) in atm_interfs[i0]:
+                ax.axvspan(c, d, color='C9', alpha=0.2)
 
-            ax.plot(x, actual_row,   label="Actual",   color='C0')
-            # ax.plot(x, adjusted_row, label="Adjusted", color='C2')
+            x = np.arange(len(spec))
+            ax.plot(x, spec, color='C0', label="Actual")
+
             if buffer > 0:
-                ax.axvspan(0, buffer - 1, color='gray', alpha=0.2)
-                ax.axvspan(n - buffer, n - 1, color='gray', alpha=0.2)
+                ax.axvspan(0, buffer-1,     color='gray', alpha=0.2)
+                ax.axvspan(len(spec)-buffer, len(spec)-1, color='gray', alpha=0.2)
+
             ax.axvspan(a, b, color='C1', alpha=0.3)
+
             ax.set_title(
-                f"Uid={meta['uid'][idx]}, Score={scores[idx]:.2f}, "
-                f"Range={a},{b}, "
-                f"Ref={meta['ref'][idx]}, Ant={meta['ant'][idx]}, "
-                f"Pol={meta['pol'][idx]}, "
-                f"Freq={meta['freq'][idx][a]:.2e}-{meta['freq'][idx][b]:.2e}"
+                f"UID={row.orig_idx}  Score={row.score:.2f}  "
+                f"Range=[{a},{b}]"
             )
             ax.set_xlabel("Channel")
             ax.set_ylabel("Amplitude")
+            ax.legend()
 
-        plt.tight_layout(rect=[0, 0, 1, 0.94])
-
-        fname = os.path.join(out_dir, f"top_{k}_NWKR_ss_fig{fig_i+1}.png")
-        plt.savefig(fname, dpi=300, bbox_inches='tight')
+        plt.tight_layout(rect=[0,0,1,0.92])
+        plt.suptitle(f"Items {fig_i*per_fig+1}–{fig_i*per_fig+fig_k} of Top {k}, sr_w {sr_w}, sra_w {sra_w}.", y=0.98)
+        outpath = os.path.join(out_dir, f"top_{k}_fig{fig_i+1}.png")
+        plt.savefig(outpath, dpi=300, bbox_inches="tight")
         plt.close(fig)
 
+def superresolve_ranges(ranges_list: list, factor: int = 4) -> list:
+    def merge(rs):
+        out = []
+        for s,e in rs:
+            if not out or s > out[-1][1] + 1:
+                out.append((s,e))
+            else:
+                out[-1] = (out[-1][0], max(out[-1][1], e))
+        return out
+
+    new = []
+    for sub in ranges_list:
+        adjusted = [(s//factor, e//factor) for s,e in sub]
+        adjusted = sorted(set(adjusted))
+        merged   = merge(adjusted)
+        new.append(adjusted)
+    return new
 
 def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
     n_rows, n_ch = specs.shape
@@ -346,7 +417,7 @@ def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
 
 
 def main():
-    DATA_PATH = "Data/bandpass_qa0_no_partitions.parquet"
+    DATA_PATH = "Data/bandpass_qa0_no_partitions_labelled_filt.parquet"
     INTERFERENCE_PATH = "Data/full_spectrum.gzip"
     W         = 3
     RANGE_CAP = 3 * W
@@ -366,17 +437,17 @@ def main():
             SR_FACTOR = 2 ** 0
         else:
             SR_FACTOR = 2 ** max(1, length // 1000)
-            break
         BUFFER = length // BUFFER_COEFF
         actual_specs, uid, ref, ant, pol, freqs, atm_interfs = groups[length]
         n_rows, row_len = actual_specs.shape
         print(f"\nBefore Preprocessing: Length={length}: {n_rows} rows, {row_len} channels")
 
+        atm_interfs_sr = superresolve_ranges(atm_interfs, factor=SR_FACTOR)
+
         actual_specs_sr = superresolve(actual_specs, factor=SR_FACTOR)
 
         n_rows, row_len = actual_specs_sr.shape
         print(f"\nAfter Preprocessing: Length={length}: {n_rows} rows, {row_len} channels, SR_factor {SR_FACTOR}")
-
 
         meta = {'uid': uid, 'ref': ref, 'ant': ant, 'pol': pol, 'freq': freqs}
 
@@ -384,7 +455,7 @@ def main():
         windows_sr, scores = polynomial_scan_ranges_parallel(
             actual_specs_sr,
             score_variance_nwkr,
-            atm_interfs=atm_interfs,
+            atm_interfs=atm_interfs_sr,
             range_cap=RANGE_CAP,
             buffer=BUFFER // SR_FACTOR,
             w=W
@@ -398,12 +469,11 @@ def main():
         data_dir = os.path.join("Data", f"length_{length}")
         os.makedirs(data_dir, exist_ok=True)
 
-        windows = [(i * SR_FACTOR, (j + 1) * SR_FACTOR - 1) for i, j in windows_sr]
+        windows = [(x * SR_FACTOR, y * SR_FACTOR) for x, y in windows_sr]
 
         plot_top_k(
             df=df,
             actual_spec_arrays=actual_specs,
-            # adjusted_spec_arrays=adjusted_specs,
             windows=windows,
             atm_interfs=atm_interfs,
             scores=scores,
@@ -416,7 +486,6 @@ def main():
             out_dir=out_dir,
             data_dir=data_dir,
         )
-        break
 
 
 if __name__ == "__main__":
