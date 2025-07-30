@@ -325,7 +325,7 @@ def plot_top_k(
     scores_np = np.array(scores)
     finite = np.isfinite(scores_np)
     indexes = np.where(finite)[0]
-    top = indexes[np.argsort(scores_np[finite])[-k:]][::-1]
+    top = indexes[np.argsort(scores_np[finite])[:]][::-1]
 
     top_uids = np.array(meta['uid'])[top]
     top_scores = np.asarray(scores)[top]
@@ -344,6 +344,8 @@ def plot_top_k(
     sub_df.insert(0, "uid", sub_df.pop("uid"))
 
     sub_df.to_csv(os.path.join(data_dir, "bandpass_qa0_no_partitions_labelled_filt_scan_stat.csv"), index=False)
+
+    top = indexes[np.argsort(scores_np[finite])[-k:]][::-1]
     
     df_slice = df.iloc[top].copy()
 
@@ -423,7 +425,7 @@ def main():
     RANGE_CAP = 3 * W
     TOP_K     = 1000
     PER_FIG   = 10
-    BUFFER_COEFF = 20
+    BUFFER_COEFF = 10
 
 
     t0 = time.perf_counter()
