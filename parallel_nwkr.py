@@ -7,6 +7,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from itertools import chain
+import numba
 from numba import njit, prange
 from scipy.signal import chirp, find_peaks, peak_widths
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -16,6 +17,8 @@ import ast
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, List
+
+numba.config.BOUNDSCHECK = True
 
 
 def match_and_correct(
@@ -195,101 +198,125 @@ def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> float:
     ssr = 0.0
     ssr_array = np.empty(n, dtype=array.dtype)
     for i in prange(n):
-        pred = numer[i] / denom[i] if denom[i] != 0.0 else 0.0
+        pred = numer[i] / denom[i] if denom[i] > 0.0 else 0.0
         diff = array[i] - pred
         ssr_array[i] = diff * diff
         ssr += ssr_array[i]
     return ssr, ssr_array
 
 @njit(parallel=True)
-def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray, sign: str, ssr_array: np.ndarray, a: int, b: int, range_cap: int) -> float:
-    ssr = 0.0
+def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray, ssr_array: np.ndarray, a: int, b: int, range_cap: int) -> float:
     m = idxs.shape[0]
+
+    sri = 0.0
+    sro_far  = 0.0
+    sro_near = 0.0
+
+    low_cut  = a - 2 * range_cap
+    high_cut = b + 2 * range_cap
+
     for ii in prange(m):
         i0 = idxs[ii]
-        num = 0.0
-        den = 0.0
-        if sign == 'in':
+        if a <= i0 <= b:
+            num = 0.0
+            den = 0.0
             for jj in range(m):
                 j0 = idxs[jj]
                 w_ij = W[i0, j0]
                 num += w_ij * array[j0]
                 den += w_ij
-            pred = num / den if den != 0.0 else 0.0
+            pred = num / den if den > 0.0 else 0.0
             diff = array[i0] - pred
-            ssr += diff * diff
-        elif sign == 'out':
-            if i0 < (a - 2 * range_cap) or i0 > (b + 1 + 2 * range_cap):
-                ssr += ssr_array[i0]
-            else:
-                for jj in range(m):
-                    j0 = idxs[jj]
-                    w_ij = W[i0, j0]
-                    num += w_ij * array[j0]
-                    den += w_ij
-                pred = num / den if den != 0.0 else 0.0
-                diff = array[i0] - pred
-                ssr += diff * diff
-    return ssr
+            sri += diff * diff
+        elif i0 < low_cut or i0 > high_cut:
+            sro_far += ssr_array[i0]
+        else:
+            num = 0.0
+            den = 0.0
+            for jj in range(m):
+                j0 = idxs[jj]
+                w_ij = W[i0, j0]
+                num += w_ij * array[j0]
+                den += w_ij
+            pred = num / den if den > 0.0 else 0.0
+            diff = array[i0] - pred
+            sro_near += diff * diff
+    return sri + sro_near + sro_far
 
 def score_variance_nwkr(array: np.ndarray, inside: np.ndarray, outside: np.ndarray, a: int, b: int, range_cap: int, W: np.ndarray, ssr_array: np.ndarray) -> float:
-    n = array.shape[0]
-    sri = ssr_region(array, inside,  W, 'in', ssr_array, a, b, range_cap)
-    sro = ssr_region(array, outside, W, 'out', ssr_array, a, b, range_cap)
+    sri = ssr_region(array, inside,  W, ssr_array, a, b, range_cap)
+    sro = ssr_region(array, outside, W, ssr_array, a, b, range_cap)
+    # print(a, "...", b, "inside:", inside)
+    # print(a, "...", b, "sri:", sri)
+    # print(a, "...", b, "outside:", outside)
+    # print(a, "...", b, "sro:", sro)
     return -(sri + sro)
 
 def _scan_row(params):
-    row_idx, row, ignore, range_cap, buffer, W = params
-    n = row.shape[0]
+    row_idx, row, ignore, range_cap, buffer, w = params
+
+    row_trimmed = row[buffer: len(row) - buffer]
+    n_trimmed = row_trimmed.shape[0]
+    W_trimmed = precompute_kernel(n_trimmed, w)
+
+    # sra, ssr_array = calculate_nwkr_sra(row, W)
+    sra, ssr_array = calculate_nwkr_sra(row_trimmed, W_trimmed)
+    # print('ssr_array shape:',ssr_array.shape)
+
     best_score = -np.inf
     best_window = (0, 0)
-    sra, ssr_array = calculate_nwkr_sra(row, W)
-
-    all_valid_ch = list(range(0, n))
-    all_ch = list(range(buffer, n - buffer))
     
-    forbidden = set()
+    ignore_trimmed = []
     for (start, end) in ignore:
-        forbidden.update(range(start, end + 1))
-
-    indices = [ch for ch in all_ch if ch not in forbidden]
+        s0 = max(start - buffer, 0)
+        e0 = min(end - buffer, n_trimmed - 1)
+        if s0 < e0:
+            ignore_trimmed.append((s0, e0))
     
-    for pos_i, i in enumerate(indices):
-        if pos_i < len(indices) - 1 and indices[pos_i + 1] - indices[pos_i] > 1:
+    all_ch_trimmed = list(range(n_trimmed))
+    forbidden   = set()
+    for s0,e0 in ignore_trimmed:
+        forbidden.update(range(s0, e0 + 1))
+    valid_trimmed = [i for i in all_ch_trimmed if i not in forbidden]
+    
+    for pos_i, i in enumerate(valid_trimmed):
+        if pos_i < len(valid_trimmed)-1 and valid_trimmed[pos_i+1] - i > 1:
             continue
-        sub_indices = indices[pos_i + 1:]
-        for pos_j, j in enumerate(sub_indices):
-            if j > i + range_cap or sub_indices[pos_j] - sub_indices[pos_j - 1] > 1:
-                break
+        for j in valid_trimmed[pos_i+1 : pos_i+1 + range_cap]:
+            inside  = np.asarray([k for k in valid_trimmed if i <= k <= j], dtype=np.int64)
+            outside = np.asarray([k for k in all_ch_trimmed if k not in inside], dtype=np.int64)
 
-            inside  = [ch for ch in indices if i <= ch <= j]
-            outside = [ch for ch in all_valid_ch if ch not in inside]
-            
             sc = score_variance_nwkr(
-                row,
-                np.asarray(inside,  dtype=np.int64),
-                np.asarray(outside, dtype=np.int64),
-                i, j, range_cap, W, ssr_array
+                np.asarray(all_ch_trimmed),
+                inside,
+                outside,
+                i, j,
+                range_cap,
+                W_trimmed,
+                ssr_array
             )
             sc = sc / sra + 1
 
             if sc > best_score:
                 best_score, best_window = sc, (i, j)
-    return row_idx, best_window, best_score
+
+    oi, oj = best_window
+    best_window_original = (oi + buffer, oj + buffer)
+
+    return row_idx, best_window_original, best_score
 
 def polynomial_scan_ranges_parallel(
     spec_arrays: np.ndarray,
     score_fn,
-    atm_interfs: List,
+    atm_interfs: List[List[Tuple[int,int]]],
     range_cap: int = 20,
     buffer: int    = 10,
     w: float       = 5.0,
 ):
-    n_rows, L = spec_arrays.shape
-    W = precompute_kernel(L, w)
+    n_rows, _ = spec_arrays.shape
 
     params = [
-        (i, spec_arrays[i], atm_interfs[i], range_cap, buffer, W)
+        (i, spec_arrays[i], atm_interfs[i], range_cap, buffer, w)
         for i in range(n_rows)
     ]
 
@@ -423,9 +450,21 @@ def main():
     INTERFERENCE_PATH = "Data/full_spectrum.gzip"
     W         = 3
     RANGE_CAP = 3 * W
-    TOP_K     = 1000
+    TOP_K     = 100
     PER_FIG   = 10
-    BUFFER_COEFF = 10
+    BUFFER_COEFF = 20
+    length_SR_FACTOR_map = {64 : 1,
+                            120 : 1,
+                            128 : 1,
+                            240 : 1,
+                            256 : 1,
+                            480 : 2,
+                            512 : 2,
+                            960 : 4,
+                            1024 : 4,
+                            1920 : 8,
+                            2048 : 8,
+                            3840 : 16}
 
 
     t0 = time.perf_counter()
@@ -435,15 +474,12 @@ def main():
     print(f"Found lengths: {sorted(groups.keys())}")
 
     for length in sorted(groups):
-        if length < 100:
-            SR_FACTOR = 2 ** 0
-        else:
-            SR_FACTOR = 2 ** max(1, length // 1000)
         BUFFER = length // BUFFER_COEFF
         actual_specs, uid, ref, ant, pol, freqs, atm_interfs = groups[length]
         n_rows, row_len = actual_specs.shape
         print(f"\nBefore Preprocessing: Length={length}: {n_rows} rows, {row_len} channels")
 
+        SR_FACTOR = length_SR_FACTOR_map[length]
         atm_interfs_sr = superresolve_ranges(atm_interfs, factor=SR_FACTOR)
 
         actual_specs_sr = superresolve(actual_specs, factor=SR_FACTOR)
