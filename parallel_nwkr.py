@@ -280,14 +280,17 @@ def _scan_row(params):
     valid_trimmed = [i for i in all_ch_trimmed if i not in forbidden]
     
     for pos_i, i in enumerate(valid_trimmed):
-        if pos_i < len(valid_trimmed)-1 and valid_trimmed[pos_i+1] - i > 1:
+        if pos_i < len(valid_trimmed) - 1 and valid_trimmed[pos_i+1] - i > 1:
             continue
-        for j in valid_trimmed[pos_i+1 : pos_i+1 + range_cap]:
+        sub_valid_trimmed = valid_trimmed[pos_i + 1 : pos_i + 1 + range_cap]
+        for pos_j, j in enumerate(sub_valid_trimmed):
+            if pos_j > 0 and sub_valid_trimmed[pos_j] - sub_valid_trimmed[pos_j - 1] > 1:
+                break
             inside  = np.asarray([k for k in valid_trimmed if i <= k <= j], dtype=np.int64)
             outside = np.asarray([k for k in all_ch_trimmed if k not in inside], dtype=np.int64)
 
             sc = score_variance_nwkr(
-                np.asarray(all_ch_trimmed),
+                row_trimmed,
                 inside,
                 outside,
                 i, j,
