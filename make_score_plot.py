@@ -166,7 +166,7 @@ def main(argv=None):
     fig1.savefig(args.png, dpi=180)
     plt.close(fig1)
 
-    png2 = Path(args.png).with_stem(Path(args.png).stem + "_chans")
+    png2 = Path(args.png).with_name(Path(args.png).stem + "_chans" + Path(args.png).suffix)
     fig2, ax2 = plt.subplots(figsize=(7, 4.5))
     scatter(ax2,
         out["win_chans"], out["score"], out["qa2flag"],

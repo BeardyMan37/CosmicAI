@@ -18,8 +18,8 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, List
 
-numba.config.BOUNDSCHECK = True
 
+ref_freq = 31.25e6
 
 def match_and_correct(
     freq_array: np.ndarray,
@@ -181,8 +181,17 @@ def precompute_kernel(L: int, w: float) -> np.ndarray:
     D = np.abs(np.subtract.outer(index, index))
     return np.exp(-(D * D) / (w * w))
 
-@njit(parallel=True)
-def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> float:
+_kernel_cache = {}
+def _get_kernel(n: int, w: float) -> np.ndarray:
+    key = (n, float(w))
+    K = _kernel_cache.get(key)
+    if K is None:
+        K = precompute_kernel(n, w)
+        _kernel_cache[key] = K
+    return K
+
+@njit(cache=True, fastmath=True, parallel=True)
+def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
     n = array.shape[0]
     numer = np.empty(n, dtype=array.dtype)
     denom = np.empty(n, dtype=array.dtype)
@@ -197,14 +206,32 @@ def calculate_nwkr_sra(array: np.ndarray, W: np.ndarray) -> float:
         denom[i] = s_den
     ssr = 0.0
     ssr_array = np.empty(n, dtype=array.dtype)
+    pred_array = np.empty(n, dtype=array.dtype)
     for i in prange(n):
         pred = numer[i] / denom[i] if denom[i] > 0.0 else 0.0
+        pred_array[i] = pred
         diff = array[i] - pred
         ssr_array[i] = diff * diff
         ssr += ssr_array[i]
-    return ssr, ssr_array
+    return ssr, ssr_array, pred_array
 
-@njit(parallel=True)
+@njit(cache=True, fastmath=True)
+def predict_on_idxs(array: np.ndarray, idxs: np.ndarray, W: np.ndarray) -> np.ndarray:
+    m = idxs.shape[0]
+    out = np.empty(m, dtype=array.dtype)
+    for ii in range(m):
+        i0 = idxs[ii]
+        num = 0.0
+        den = 0.0
+        for jj in range(m):
+            j0 = idxs[jj]
+            w_ij = W[i0, j0]
+            num += w_ij * array[j0]
+            den += w_ij
+        out[ii] = num / den if den > 1e-12 else 0.0
+    return out
+
+@njit(cache=True, fastmath=True, parallel=True)
 def ssr_region(array: np.ndarray, idxs: np.ndarray, W: np.ndarray, ssr_array: np.ndarray, a: int, b: int, range_cap: int) -> float:
     m = idxs.shape[0]
 
@@ -253,18 +280,26 @@ def score_variance_nwkr(array: np.ndarray, inside: np.ndarray, outside: np.ndarr
     return -(sri + sro)
 
 def _scan_row(params):
-    row_idx, row, ignore, range_cap, buffer, w = params
+    row_idx, row, ignore, freqs, buffer, max_w = params
+
+    freq_step = abs(freqs[1] - freqs[0])
+    kernel_factor = math.floor(math.log2(ref_freq / freq_step))
+    w         = min(3 + 2 * kernel_factor, max_w)
+    range_cap = 3 * w
+
 
     row_trimmed = row[buffer: len(row) - buffer]
     n_trimmed = row_trimmed.shape[0]
-    W_trimmed = precompute_kernel(n_trimmed, w)
+    W_trimmed = _get_kernel(n_trimmed, w)
 
     # sra, ssr_array = calculate_nwkr_sra(row, W)
-    sra, ssr_array = calculate_nwkr_sra(row_trimmed, W_trimmed)
+    sra, ssr_array, pred_array = calculate_nwkr_sra(row_trimmed, W_trimmed)
     # print('ssr_array shape:',ssr_array.shape)
 
     best_score = -np.inf
     best_window = (0, 0)
+    best_sri_pred_idx_full = None
+    best_sri_pred_vals = None
     
     ignore_trimmed = []
     for (start, end) in ignore:
@@ -302,38 +337,46 @@ def _scan_row(params):
 
             if sc > best_score:
                 best_score, best_window = sc, (i, j)
+                sri_pred_vals_trim = predict_on_idxs(row_trimmed, inside, W_trimmed)
+                best_sri_pred_idx_full = (inside + buffer)
+                best_sri_pred_vals = sri_pred_vals_trim
 
     oi, oj = best_window
     best_window_original = (oi + buffer, oj + buffer)
 
-    return row_idx, best_window_original, best_score
+    return (row_idx, best_window_original, best_score, pred_array, best_sri_pred_idx_full, best_sri_pred_vals, w, range_cap)
 
 def polynomial_scan_ranges_parallel(
     spec_arrays: np.ndarray,
     score_fn,
     atm_interfs: List[List[Tuple[int,int]]],
-    range_cap: int = 20,
-    buffer: int    = 10,
-    w: float       = 5.0,
+    freq_arrays: np.ndarray,
+    buffer: int,
+    max_w: int,
+
 ):
     n_rows, _ = spec_arrays.shape
 
     params = [
-        (i, spec_arrays[i], atm_interfs[i], range_cap, buffer, w)
+        (i, spec_arrays[i], atm_interfs[i], freq_arrays[i], buffer, max_w)
         for i in range(n_rows)
     ]
 
     results = []
     with ProcessPoolExecutor() as exe:
-        futures = [exe.submit(_scan_row, p) for p in params]
+        futures = [exe.submit(score_fn, p) for p in params]
         for f in as_completed(futures):
             results.append(f.result())
 
     results.sort(key=lambda x: x[0])
     windows = [r[1] for r in results]
     scores  = [r[2] for r in results]
-    return windows, scores
-
+    sra_preds = [r[3] for r in results]
+    sri_idxs  = [r[4] for r in results]
+    sri_vals  = [r[5] for r in results]
+    ws = [r[6] for r in results]
+    range_caps = [r[7] for r in results]
+    return windows, scores, sra_preds, sri_idxs, sri_vals, ws, range_caps
 
 def plot_top_k(
     df: pd.DataFrame,
@@ -342,15 +385,19 @@ def plot_top_k(
     atm_interfs:list,
     scores: list,
     meta: dict,
-    sr_w: int = 5,
-    sra_w: int = 5,
+    ws: list,
     k: int = 10,
     per_fig: int = 10,
     buffer: int = 10,
     out_dir: str = "Images",
     data_dir: str = "Data",
+    sra_preds: list = None,
+    sri_idxs: list = None,
+    sri_vals: list = None,
+    sr_factor: int = 1,
 ):
     os.makedirs(out_dir, exist_ok=True)
+    buf_orig = buffer * sr_factor
 
     scores_np = np.array(scores)
     finite = np.isfinite(scores_np)
@@ -360,12 +407,15 @@ def plot_top_k(
     top_uids = np.array(meta['uid'])[top]
     top_scores = np.asarray(scores)[top]
     top_windows = np.asarray(windows)[top]
+    top_ws = np.asarray(ws)[top]
     
     sub_df = df.loc[df["uid"].isin(top_uids)].copy()
     score_map  = dict(zip(top_uids, top_scores))
     window_map = dict(zip(top_uids, top_windows))
+    kernel_map = dict(zip(top_uids, top_ws))
 
     sub_df["score"]  = sub_df["uid"].map(score_map)
+    sub_df["kernel_size"]  = sub_df["uid"].map(kernel_map)
     sub_df[["win_start", "win_end"]] = (
         sub_df["uid"].map(window_map).apply(pd.Series)
     )
@@ -381,6 +431,7 @@ def plot_top_k(
 
     df_slice["orig_idx"] = top
     df_slice["score"]    = scores_np[top]
+    df_slice["kernel_size"] = [ws[i] for i in top]
     df_slice["win_start"] = [windows[i][0] for i in top]
     df_slice["win_end"]   = [windows[i][1] for i in top]
 
@@ -403,22 +454,40 @@ def plot_top_k(
             x = np.arange(len(spec))
             ax.plot(x, spec, color='C0', label="Actual")
 
-            if buffer > 0:
-                ax.axvspan(0, buffer-1,     color='gray', alpha=0.2)
-                ax.axvspan(len(spec)-buffer, len(spec)-1, color='gray', alpha=0.2)
+            if buf_orig > 0:
+                ax.axvspan(0, buf_orig - 1, color='gray', alpha=0.2)
+                ax.axvspan(len(spec) - buf_orig, len(spec) - 1, color='gray', alpha=0.2) 
 
             ax.axvspan(a, b, color='C1', alpha=0.3)
 
+            if sra_preds is not None:
+                pred_full = np.full(len(spec), np.nan)
+                sra_sr = sra_preds[i0]
+                sra_up = np.repeat(sra_sr, sr_factor)
+                end = len(spec) - buf_orig
+                pred_full[buf_orig:end] = sra_up[:end-buf_orig]
+                ax.plot(np.arange(len(spec)), pred_full, '.', ms=2, label="SRA pred")
+
+            if (sri_idxs is not None) and (sri_vals is not None):
+                sri_full = np.full(len(spec), np.nan)
+                idx_sr  = np.asarray(sri_idxs[i0], dtype=int)
+                val_sr  = np.asarray(sri_vals[i0], dtype=float)
+                idx_orig_start = idx_sr * sr_factor
+                for p, v in zip(idx_orig_start, val_sr):
+                    p_end = min(p + sr_factor, len(spec))
+                    sri_full[p:p_end] = v
+                ax.plot(np.arange(len(spec)), sri_full, '.', ms=2, label="SRI pred")
+
             ax.set_title(
                 f"UID={row.orig_idx}  Score={row.score:.2f}  "
-                f"Range=[{a},{b}]"
+                f"Range=[{a},{b}] Kernel size={row.kernel_size}"
             )
             ax.set_xlabel("Channel")
             ax.set_ylabel("Amplitude")
             ax.legend()
 
         plt.tight_layout(rect=[0,0,1,0.92])
-        plt.suptitle(f"Items {fig_i*per_fig+1}–{fig_i*per_fig+fig_k} of Top {k}, sr_w {sr_w}, sra_w {sra_w}.", y=0.98)
+        plt.suptitle(f"Items {fig_i*per_fig+1}–{fig_i*per_fig+fig_k} of Top {k}", y=0.98)
         outpath = os.path.join(out_dir, f"top_{k}_fig{fig_i+1}.png")
         plt.savefig(outpath, dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -438,7 +507,7 @@ def superresolve_ranges(ranges_list: list, factor: int = 4) -> list:
         adjusted = [(s//factor, e//factor) for s,e in sub]
         adjusted = sorted(set(adjusted))
         merged   = merge(adjusted)
-        new.append(adjusted)
+        new.append(merged)
     return new
 
 def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
@@ -447,12 +516,73 @@ def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
     trimmed = specs[:, :n_blk * factor]
     return trimmed.reshape(n_rows, n_blk, factor).mean(axis=2)
 
+def refine_windows_exact_for_length(
+    spec_arrays: np.ndarray,
+    windows_sr: List[Tuple[int, int]],
+    atm_interfs: List[List[Tuple[int,int]]],
+    ws: list,
+    range_caps: list,
+    sr_factor: int,
+    buffer: int,
+) -> List[Tuple[int,int]]:
+    n_rows, n_ch = spec_arrays.shape
+    n_trimmed = n_ch - 2 * buffer
+    if n_trimmed <= 0:
+        return [(0, 0)] * n_rows
+
+    refined = []
+
+    for i in range(n_rows):
+        W_trimmed = _get_kernel(n_trimmed, ws[i])
+        range_cap = range_caps[i]
+        spec_array = spec_arrays[i]
+        row_trimmed = spec_array[buffer : n_ch - buffer]
+
+        sra, ssr_array, _ = calculate_nwkr_sra(row_trimmed, W_trimmed)
+
+        forbidden = set()
+        for (s, e) in atm_interfs[i]:
+            s0 = max(s - buffer, 0)
+            e0 = min(e - buffer, n_trimmed - 1)
+            if s0 <= e0:
+                forbidden.update(range(s0, e0 + 1))
+        valid = [ix for ix in range(n_trimmed) if ix not in forbidden]
+
+        x_sr, y_sr = windows_sr[i]
+
+        a_lo = max(x_sr * sr_factor - buffer, 0)
+        a_hi = min((x_sr + 1) * sr_factor - 1 - buffer, n_trimmed - 1)
+        b_lo = max(y_sr * sr_factor - buffer, 0)
+        b_hi = min((y_sr + 1) * sr_factor - 1 - buffer, n_trimmed - 1)
+
+        best_sc = -np.inf
+        best_ab = (a_lo, max(a_lo, b_lo))
+
+        for a in range(a_lo, a_hi + 1):
+            start_b = max(a, b_lo)
+            for b in range(start_b, b_hi + 1):
+                inside = np.fromiter((k for k in valid if a <= k <= b), dtype=np.int64)
+                if inside.size == 0:
+                    continue
+                outside = np.fromiter((k for k in valid if k < a or k > b), dtype=np.int64)
+
+                sc = score_variance_nwkr(
+                    row_trimmed, inside, outside, a, b,
+                    range_cap, W_trimmed, ssr_array
+                )
+                sc = sc / sra + 1.0
+                if sc > best_sc:
+                    best_sc = sc
+                    best_ab = (a, b)
+
+        a_t, b_t = best_ab
+        refined.append((a_t + buffer, b_t + buffer))
+
+    return refined
 
 def main():
     DATA_PATH = "Data/bandpass_qa0_no_partitions_labelled_filt.parquet"
     INTERFERENCE_PATH = "Data/full_spectrum.gzip"
-    W         = 3
-    RANGE_CAP = 3 * W
     TOP_K     = 100
     PER_FIG   = 10
     BUFFER_COEFF = 20
@@ -469,6 +599,18 @@ def main():
                             2048 : 8,
                             3840 : 16}
 
+    length_w_map = {64 : 3,
+                    120 : 3,
+                    128 : 3,
+                    240 : 7,
+                    256 : 7,
+                    480 : 15,
+                    512 : 15,
+                    960 : 31,
+                    1024 : 31,
+                    1920 : 63,
+                    2048 : 63,
+                    3840 : 127}
 
     t0 = time.perf_counter()
     df, groups = load_data_by_length(DATA_PATH, INTERFERENCE_PATH)
@@ -493,13 +635,13 @@ def main():
         meta = {'uid': uid, 'ref': ref, 'ant': ant, 'pol': pol, 'freq': freqs}
 
         t2 = time.perf_counter()
-        windows_sr, scores = polynomial_scan_ranges_parallel(
-            actual_specs_sr,
-            score_variance_nwkr,
+        windows_sr, scores, sra_preds, sri_idxs, sri_vals, ws, range_caps = polynomial_scan_ranges_parallel(
+            spec_arrays=actual_specs_sr,
+            score_fn=_scan_row,
             atm_interfs=atm_interfs_sr,
-            range_cap=RANGE_CAP,
+            freq_arrays=freqs,
             buffer=BUFFER // SR_FACTOR,
-            w=W
+            max_w=length_w_map[length],
         )
         t3 = time.perf_counter()
         print(f"  Scan time: {t3-t2:.3f}s")
@@ -510,22 +652,36 @@ def main():
         data_dir = os.path.join("Data", f"length_{length}")
         os.makedirs(data_dir, exist_ok=True)
 
-        windows = [(x * SR_FACTOR, y * SR_FACTOR) for x, y in windows_sr]
+        if SR_FACTOR > 1:
+            windows_exact = refine_windows_exact_for_length(
+                actual_specs,
+                windows_sr,
+                atm_interfs,
+                ws,
+                range_caps,
+                SR_FACTOR,
+                BUFFER
+            )
+        else:
+            windows_exact = windows_sr
 
         plot_top_k(
             df=df,
             actual_spec_arrays=actual_specs,
-            windows=windows,
+            windows=windows_exact,
             atm_interfs=atm_interfs,
             scores=scores,
             meta=meta,
-            sr_w=W,
-            sra_w=W,
+            ws=ws,
             k=min(TOP_K, n_rows),
             per_fig=PER_FIG,
             buffer=BUFFER // SR_FACTOR,
             out_dir=out_dir,
             data_dir=data_dir,
+            sra_preds=sra_preds,
+            sri_idxs=sri_idxs,
+            sri_vals=sri_vals,
+            sr_factor=SR_FACTOR,
         )
 
 
