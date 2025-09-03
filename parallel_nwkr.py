@@ -19,7 +19,7 @@ import pandas as pd
 from typing import Dict, Tuple, List
 
 
-ref_freq = 31.25e6
+ref_freq = 0.0625
 
 def match_and_correct(
     freq_array: np.ndarray,
@@ -89,7 +89,7 @@ def load_data_by_length(data_path: str,
 
         df['atmospheric_interference'] = interference
         actual_specs = [np.array(ast.literal_eval(s), dtype=float)
-                 for s in df['spec_arrays']]
+                 for s in df['amplitude_corr_tsys']]
         freqs = [np.array(x, dtype=float)
                  for x in df['frequency_array'].tolist()]
     elif data_path.endswith('.parquet'):
@@ -280,13 +280,19 @@ def score_variance_nwkr(array: np.ndarray, inside: np.ndarray, outside: np.ndarr
     return -(sri + sro)
 
 def _scan_row(params):
-    row_idx, row, ignore, freqs, buffer, max_w = params
+    row_idx, row, ignore, freqs, buffer, sr_factor = params
+
+    # gamma=0.66
+    # a=0.33
+    # b=0.33
 
     freq_step = abs(freqs[1] - freqs[0])
-    kernel_factor = math.floor(math.log2(ref_freq / freq_step))
-    w         = min(3 + 2 * kernel_factor, max_w)
-    range_cap = 3 * w
+    L = len(freqs)
+    R = ref_freq / freq_step
+    # w = round(gamma * (R**a) * (L**b))
 
+    w = int(round(max(3, min(R / sr_factor, L / 16))))
+    range_cap = 3 * w
 
     row_trimmed = row[buffer: len(row) - buffer]
     n_trimmed = row_trimmed.shape[0]
@@ -317,7 +323,7 @@ def _scan_row(params):
     for pos_i, i in enumerate(valid_trimmed):
         if pos_i < len(valid_trimmed) - 1 and valid_trimmed[pos_i+1] - i > 1:
             continue
-        sub_valid_trimmed = valid_trimmed[pos_i + 1 : pos_i + 1 + range_cap]
+        sub_valid_trimmed = valid_trimmed[pos_i + 1 : min(pos_i + 1 + range_cap, len(valid_trimmed) - 1)]
         for pos_j, j in enumerate(sub_valid_trimmed):
             if pos_j > 0 and sub_valid_trimmed[pos_j] - sub_valid_trimmed[pos_j - 1] > 1:
                 break
@@ -344,7 +350,7 @@ def _scan_row(params):
     oi, oj = best_window
     best_window_original = (oi + buffer, oj + buffer)
 
-    return (row_idx, best_window_original, best_score, pred_array, best_sri_pred_idx_full, best_sri_pred_vals, w, range_cap)
+    return (row_idx, best_window_original, best_score, pred_array, best_sri_pred_idx_full, best_sri_pred_vals, w * sr_factor, range_cap * sr_factor)
 
 def polynomial_scan_ranges_parallel(
     spec_arrays: np.ndarray,
@@ -352,13 +358,13 @@ def polynomial_scan_ranges_parallel(
     atm_interfs: List[List[Tuple[int,int]]],
     freq_arrays: np.ndarray,
     buffer: int,
-    max_w: int,
+    sr_factor: int,
 
 ):
     n_rows, _ = spec_arrays.shape
 
     params = [
-        (i, spec_arrays[i], atm_interfs[i], freq_arrays[i], buffer, max_w)
+        (i, spec_arrays[i], atm_interfs[i], freq_arrays[i], buffer, sr_factor)
         for i in range(n_rows)
     ]
 
@@ -397,7 +403,7 @@ def plot_top_k(
     sr_factor: int = 1,
 ):
     os.makedirs(out_dir, exist_ok=True)
-    buf_orig = buffer * sr_factor
+    buf_orig = buffer
 
     scores_np = np.array(scores)
     finite = np.isfinite(scores_np)
@@ -492,7 +498,7 @@ def plot_top_k(
         plt.savefig(outpath, dpi=300, bbox_inches="tight")
         plt.close(fig)
 
-def superresolve_ranges(ranges_list: list, factor: int = 4) -> list:
+def superresolve_ranges(ranges_list: list, factor: int) -> list:
     def merge(rs):
         out = []
         for s,e in rs:
@@ -510,7 +516,7 @@ def superresolve_ranges(ranges_list: list, factor: int = 4) -> list:
         new.append(merged)
     return new
 
-def superresolve(specs: np.ndarray, factor: int = 4) -> np.ndarray:
+def superresolve(specs: np.ndarray, factor: int) -> np.ndarray:
     n_rows, n_ch = specs.shape
     n_blk = n_ch // factor
     trimmed = specs[:, :n_blk * factor]
@@ -556,7 +562,7 @@ def refine_windows_exact_for_length(
         b_hi = min((y_sr + 1) * sr_factor - 1 - buffer, n_trimmed - 1)
 
         best_sc = -np.inf
-        best_ab = (a_lo, max(a_lo, b_lo))
+        best_ab = (x_sr, y_sr)
 
         for a in range(a_lo, a_hi + 1):
             start_b = max(a, b_lo)
@@ -564,7 +570,7 @@ def refine_windows_exact_for_length(
                 inside = np.fromiter((k for k in valid if a <= k <= b), dtype=np.int64)
                 if inside.size == 0:
                     continue
-                outside = np.fromiter((k for k in valid if k < a or k > b), dtype=np.int64)
+                outside = np.fromiter((k for k in valid if k not in inside), dtype=np.int64)
 
                 sc = score_variance_nwkr(
                     row_trimmed, inside, outside, a, b,
@@ -581,7 +587,7 @@ def refine_windows_exact_for_length(
     return refined
 
 def main():
-    DATA_PATH = "Data/bandpass_qa0_no_partitions_labelled_filt.parquet"
+    DATA_PATH = "Data/spotcheck.csv"
     INTERFERENCE_PATH = "Data/full_spectrum.gzip"
     TOP_K     = 100
     PER_FIG   = 10
@@ -598,20 +604,6 @@ def main():
                             1920 : 8,
                             2048 : 8,
                             3840 : 16}
-
-    length_w_map = {64 : 3,
-                    120 : 3,
-                    128 : 3,
-                    240 : 7,
-                    256 : 7,
-                    480 : 15,
-                    512 : 15,
-                    960 : 31,
-                    1024 : 31,
-                    1920 : 63,
-                    2048 : 63,
-                    3840 : 127}
-
     t0 = time.perf_counter()
     df, groups = load_data_by_length(DATA_PATH, INTERFERENCE_PATH)
     t1 = time.perf_counter()
@@ -628,6 +620,7 @@ def main():
         atm_interfs_sr = superresolve_ranges(atm_interfs, factor=SR_FACTOR)
 
         actual_specs_sr = superresolve(actual_specs, factor=SR_FACTOR)
+        freqs_sr = superresolve(freqs, factor=SR_FACTOR)
 
         n_rows, row_len = actual_specs_sr.shape
         print(f"\nAfter Preprocessing: Length={length}: {n_rows} rows, {row_len} channels, SR_factor {SR_FACTOR}")
@@ -639,9 +632,9 @@ def main():
             spec_arrays=actual_specs_sr,
             score_fn=_scan_row,
             atm_interfs=atm_interfs_sr,
-            freq_arrays=freqs,
+            freq_arrays=freqs_sr,
             buffer=BUFFER // SR_FACTOR,
-            max_w=length_w_map[length],
+            sr_factor=SR_FACTOR,
         )
         t3 = time.perf_counter()
         print(f"  Scan time: {t3-t2:.3f}s")
@@ -675,7 +668,7 @@ def main():
             ws=ws,
             k=min(TOP_K, n_rows),
             per_fig=PER_FIG,
-            buffer=BUFFER // SR_FACTOR,
+            buffer=BUFFER,
             out_dir=out_dir,
             data_dir=data_dir,
             sra_preds=sra_preds,
