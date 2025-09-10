@@ -25,7 +25,7 @@ from pathlib import Path
 import pandas as pd
 
 KEYS   = ["eb_uid", "antenna", "spw_name_ms", "polarization"]
-STATS  = ["atmospheric_interference", "score", "win_start", "win_end"]
+STATS  = ["atmospheric_interference", "score_masked", "score_unmasked", "score_fixed", "kernel_size", "win_masked_start", "win_masked_end",	"win_unmasked_start", "win_unmasked_end", "win_fixed_start", "win_fixed_end", "overlap_unmasked_pct", "overlap_fixed_pct", "fixed_bins_native", "rank_score"]
 CSV_GLOB = "length_*/*.csv"
 
 # ---------------------------------------------------------------------------

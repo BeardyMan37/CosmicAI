@@ -29,6 +29,8 @@ from typing import Any, Callable, Dict, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 from numba import njit, prange
 from scipy.signal import find_peaks, peak_widths
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -121,7 +123,7 @@ def load_data_by_length(
 
     if data_path.endswith(".csv"):
         df = pd.read_csv(data_path, sep="|", dtype=str, header=0)
-        df["uid"] = df.index
+        df["uid"] = df.index.copy()
         df = df.reset_index(drop=True)
         df["frequency_array"] = df["frequency_array"].apply(_parse_freqs)
         trans_df = pd.read_parquet(interference_path)
@@ -168,7 +170,7 @@ def load_data_by_length(
 
     elif data_path.endswith(".parquet"):
         df = pd.read_parquet(data_path)
-        df["uid"] = df.index
+        df["uid"] = df.index.copy()
         df = df.reset_index(drop=True)
         # Hz->GHz
         df["frequency_array"] = df["frequency_array"].apply(lambda xs: [f / 1e9 for f in xs])
@@ -437,104 +439,172 @@ def score_variance_nwkr(
 # -----------------------------------------------------------------------------#
 
 def _scan_row(params: Tuple[int, np.ndarray, List[Tuple[int, int]], np.ndarray, int, int]
-              ) -> Tuple[int, Tuple[int, int], float, np.ndarray, np.ndarray | None, np.ndarray | None, int, int]:
-    """Scan a single row to find the best contiguous window by NWKR score.
+              ) -> Tuple[
+    # masked var-len (existing)
+    int, Tuple[int, int], float, np.ndarray, np.ndarray | None, np.ndarray | None, int, int,
+    # unmasked var-len (new) + overlap
+    Tuple[int, int], float, float, int, np.ndarray | None, np.ndarray | None,
+    # fixed-len linear (new) + overlap
+    Tuple[int, int], float, float, int, np.ndarray | None, np.ndarray | None, int
+]:
+    """Scan a row in three modes: masked var-len, unmasked var-len, fixed-len linear.
 
-    Args:
-      params: Tuple of (row_idx, row, ignore, freqs, buffer, sr_factor):
-        row_idx: integer row id (for ordering).
-        row: 1D spectrum values.
-        ignore: list of (start_idx, end_idx) to ignore (interference).
-        freqs: 1D frequency array (GHz), same length as row.
-        buffer: number of channels to drop on each side.
-        sr_factor: super-resolution block size used in the coarse pass.
-
-    Returns:
-      (row_idx,
-       best_window_original,  # (start,end) indices (inclusive) in original (trimmed+buffer) coordinates
-       best_score,            # normalized score
-       pred_array,            # NWKR predictions for trimmed row
-       best_sri_pred_idx_full,# inside indices (original coordinates) for best window (or None)
-       best_sri_pred_vals,    # NWKR predictions on inside indices (or None)
-       eff_kernel_size,       # kernel size in original scale (w*sr_factor)
-       eff_range_cap)         # range cap in original scale (range_cap*sr_factor)
+    Returns (in order):
+      A) masked var-len:
+         row_idx, best_win_masked, best_sc_masked, pred_array_trimmed,
+         sri_idx_masked, sri_vals_masked, eff_kernel_native, eff_range_cap_native
+      B) unmasked var-len:
+         best_win_unmasked, best_sc_unmasked, overlap_pct_unmasked, overlap_cnt_unmasked,
+         sri_idx_unmasked, sri_vals_unmasked
+      C) fixed-len linear (span ≈ ref_freq, unmasked):
+         best_win_fixed, best_sc_fixed, overlap_pct_fixed, overlap_cnt_fixed,
+         sri_idx_fixed, sri_vals_fixed, fixed_bins_native
     """
     row_idx, row, ignore, freqs, buffer, sr_factor = params
 
-    if len(freqs) < 2 or not np.isfinite(freqs[:2]).all():
-        return (row_idx, (0, 0), -np.inf, np.array([]), None, None, 0, 0)
+    def _overlap_stats(a_orig: int, b_orig: int, ignore_ranges: List[Tuple[int, int]]) -> Tuple[float, int]:
+        if b_orig < a_orig:
+            return 0.0, 0
+        win_len = (b_orig - a_orig + 1)
+        if win_len <= 0:
+            return 0.0, 0
+        overlap = 0
+        for s, e in ignore_ranges:
+            lo = max(a_orig, s)
+            hi = min(b_orig, e)
+            if hi >= lo:
+                overlap += (hi - lo + 1)
+        return overlap / win_len
 
+    def _safe_freq_step(fs: np.ndarray) -> float:
+        d = np.diff(fs)
+        d = d[np.isfinite(d)]
+        return float(np.nanmedian(d)) if d.size else 0.0
+
+    # Guards
+    if len(freqs) < 2 or not np.isfinite(freqs[:2]).all():
+        return (
+            row_idx, (0,0), -np.inf, np.array([]), None, None, 0, 0,
+            (0,0), -np.inf, 0.0, 0, None, None,
+            (0,0), -np.inf, 0.0, 0, None, None, 0
+        )
+
+    # Kernel/trim setup (shared)
     freq_step = abs(freqs[1] - freqs[0])
     L = len(freqs)
-    R = ref_freq / freq_step
+    R = ref_freq / (freq_step if freq_step > 0 else 1.0)
     w = int(round(max(3, min(R / sr_factor, L / 16))))
     range_cap = 3 * w
 
     row_trimmed = row[buffer: len(row) - buffer]
     n_trimmed = row_trimmed.shape[0]
     if n_trimmed <= 0:
-        return (row_idx, (0, 0), -np.inf, np.array([]), None, None, 0, 0)
+        return (
+            row_idx, (0,0), -np.inf, np.array([]), None, None, 0, 0,
+            (0,0), -np.inf, 0.0, 0, None, None,
+            (0,0), -np.inf, 0.0, 0, None, None, 0
+        )
 
     W_trimmed = _get_kernel(n_trimmed, w)
     sra, ssr_array, pred_array = calculate_nwkr_sra(row_trimmed, W_trimmed)
     sra = sra if sra > 1e-12 else 1e-12
 
-    # Interference → mask
+    # Build ignore mask for masked mode (trimmed coords)
     ignore_trimmed: List[Tuple[int, int]] = []
     for (start, end) in ignore:
         s0 = max(start - buffer, 0)
         e0 = min(end - buffer, n_trimmed - 1)
         if s0 < e0:
             ignore_trimmed.append((s0, e0))
+
     mask = np.ones(n_trimmed, dtype=np.bool_)
     for s0, e0 in ignore_trimmed:
         mask[s0:e0 + 1] = False
-    valid_trimmed = np.nonzero(mask)[0]
-    all_ch_trimmed = np.arange(n_trimmed)
 
-    best_score = -np.inf
-    best_window = (0, 0)
-    best_sri_pred_idx_full = None
-    best_sri_pred_vals = None
+    all_trimmed = np.arange(n_trimmed)
+    valid_masked = np.nonzero(mask)[0]
 
-    for pos_i, i in enumerate(valid_trimmed):
-        # Enforce contiguous starts
-        if pos_i < len(valid_trimmed) - 1 and (valid_trimmed[pos_i + 1] - i) > 1:
-            continue
-        stop = min(pos_i + 1 + range_cap, len(valid_trimmed))
-        sub_valid_trimmed = valid_trimmed[pos_i + 1: stop]
-        for pos_j, j in enumerate(sub_valid_trimmed):
-            # Keep contiguity for j; prune on first gap
-            if pos_j > 0 and (sub_valid_trimmed[pos_j] - sub_valid_trimmed[pos_j - 1]) > 1:
-                break
+    # ---------- variable-length search helper ----------
+    def _varlen_search(valid: np.ndarray) -> Tuple[Tuple[int,int], float, np.ndarray | None, np.ndarray | None]:
+        best_sc = -np.inf
+        best_win = (0, 0)
+        best_idx_full = None
+        best_vals = None
 
-            # Inside indices as a contiguous slice in valid_trimmed
-            lo = pos_i
-            hi = pos_i + 1 + pos_j
-            inside = valid_trimmed[lo:hi + 1]
-            outside = np.setdiff1d(all_ch_trimmed, inside, assume_unique=True)
+        n_valid = valid.shape[0]
+        for pos_i in range(n_valid):
+            i = valid[pos_i]
+            # enforce contiguous start
+            if pos_i < n_valid - 1 and (valid[pos_i + 1] - i) > 1:
+                continue
+            stop = min(pos_i + 1 + range_cap, n_valid)
+            sub = valid[pos_i + 1: stop]
+            for pos_j in range(sub.shape[0]):
+                j = sub[pos_j]
+                # keep contiguity for j; prune on first gap
+                if pos_j > 0 and (sub[pos_j] - sub[pos_j - 1]) > 1:
+                    break
+                lo = pos_i
+                hi = pos_i + 1 + pos_j
+                inside = valid[lo:hi + 1]
+                outside = np.setdiff1d(all_trimmed, inside, assume_unique=True)
+                sc = score_variance_nwkr(row_trimmed, inside, outside, i, j, range_cap, W_trimmed, ssr_array)
+                sc = sc / sra + 1.0
+                if sc > best_sc:
+                    best_sc = sc
+                    best_win = (i, j)
+                    best_idx_full = inside + buffer
+                    best_vals = predict_on_idxs(row_trimmed, inside, W_trimmed)
+        oi, oj = best_win
+        return (oi + buffer, oj + buffer), best_sc, best_idx_full, best_vals
 
+    # ---------- fixed-length linear sweep (span ~ ref_freq, unmasked) ----------
+    # step_med = _safe_freq_step(freqs)
+    # window_bins = int(np.floor(ref_freq / (step_med if step_med > 0 else 1.0)))
+    # window_bins = max(1, min(window_bins, n_trimmed))
+    window_bins = min(int(round(R)), n_trimmed)
+
+    def _fixedlen_sweep() -> Tuple[Tuple[int,int], float, np.ndarray | None, np.ndarray | None]:
+        best_sc = -np.inf
+        best_win = (0, 0)
+        best_idx_full = None
+        best_vals = None
+
+        max_start = max(0, n_trimmed - window_bins)
+        for i in range(max_start + 1):
+            inside = np.arange(i, i + window_bins, dtype=np.int64)
+            outside = np.setdiff1d(all_trimmed, inside, assume_unique=False)
+            j = i + window_bins - 1
             sc = score_variance_nwkr(row_trimmed, inside, outside, i, j, range_cap, W_trimmed, ssr_array)
             sc = sc / sra + 1.0
+            if sc > best_sc:
+                best_sc = sc
+                best_win = (i, j)
+                best_idx_full = inside + buffer
+                best_vals = predict_on_idxs(row_trimmed, inside, W_trimmed)
+        oi, oj = best_win
+        return (oi + buffer, oj + buffer), best_sc, best_idx_full, best_vals
 
-            if sc > best_score:
-                best_score = sc
-                best_window = (i, j)
-                best_sri_pred_idx_full = inside + buffer
-                best_sri_pred_vals = predict_on_idxs(row_trimmed, inside, W_trimmed)
+    # A) masked var-len
+    best_win_masked, best_sc_masked, sri_idx_masked, sri_vals_masked = _varlen_search(valid_masked)
 
-    oi, oj = best_window
-    best_window_original = (oi + buffer, oj + buffer)
+    # B) unmasked var-len + overlap
+    best_win_unmasked, best_sc_unmasked, sri_idx_unmasked, sri_vals_unmasked = _varlen_search(all_trimmed)
+    overlap_pct_unmasked = _overlap_stats(best_win_unmasked[0], best_win_unmasked[1], ignore)
+
+    # C) fixed-len linear (unmasked) + overlap
+    best_win_fixed, best_sc_fixed, sri_idx_fixed, sri_vals_fixed = _fixedlen_sweep()
+    overlap_pct_fixed = _overlap_stats(best_win_fixed[0], best_win_fixed[1], ignore)
+
     return (
-        row_idx,
-        best_window_original,
-        best_score,
-        pred_array,
-        best_sri_pred_idx_full,
-        best_sri_pred_vals,
-        w * sr_factor,
-        range_cap * sr_factor,
+        # masked var-len
+        row_idx, best_win_masked, best_sc_masked, pred_array, sri_idx_masked, sri_vals_masked, w * sr_factor, range_cap * sr_factor,
+        # unmasked var-len
+        best_win_unmasked, best_sc_unmasked, overlap_pct_unmasked, sri_idx_unmasked, sri_vals_unmasked,
+        # fixed-len linear
+        best_win_fixed, best_sc_fixed, overlap_pct_fixed, sri_idx_fixed, sri_vals_fixed, window_bins * sr_factor
     )
+
 
 
 # -----------------------------------------------------------------------------#
@@ -578,14 +648,34 @@ def polynomial_scan_ranges_parallel(
             results.append(f.result())
 
     results.sort(key=lambda x: x[0])
-    windows = [r[1] for r in results]
-    scores = [r[2] for r in results]
-    sra_preds = [r[3] for r in results]
-    sri_idxs = [r[4] for r in results]
-    sri_vals = [r[5] for r in results]
-    ws = [r[6] for r in results]
-    range_caps = [r[7] for r in results]
-    return windows, scores, sra_preds, sri_idxs, sri_vals, ws, range_caps
+    
+    # masked var-len
+    windows_masked   = [r[1]  for r in results]
+    scores_masked    = [r[2]  for r in results]
+    sra_preds        = [r[3]  for r in results]
+    sri_idxs_masked  = [r[4]  for r in results]
+    sri_vals_masked  = [r[5]  for r in results]
+    ws               = [r[6]  for r in results]
+    range_caps       = [r[7]  for r in results]
+
+    # unmasked var-len
+    windows_unmasked = [r[8]  for r in results]
+    scores_unmasked  = [r[9]  for r in results]
+    overlap_pct_unm  = [r[10] for r in results]
+    sri_idxs_unm     = [r[11] for r in results]
+    sri_vals_unm     = [r[12] for r in results]
+
+    # fixed-len linear
+    windows_fixed    = [r[13] for r in results]
+    scores_fixed     = [r[14] for r in results]
+    overlap_pct_fix  = [r[15] for r in results]
+    sri_idxs_fixed   = [r[16] for r in results]
+    sri_vals_fixed   = [r[17] for r in results]
+    fixed_bins_nat   = [r[18] for r in results]
+
+    return (windows_masked, scores_masked, sra_preds, sri_idxs_masked, sri_vals_masked, ws, range_caps,
+            windows_unmasked, scores_unmasked, overlap_pct_unm, sri_idxs_unm, sri_vals_unm,
+            windows_fixed, scores_fixed, overlap_pct_fix, sri_idxs_fixed, sri_vals_fixed, fixed_bins_nat)
 
 
 # -----------------------------------------------------------------------------#
@@ -595,64 +685,109 @@ def polynomial_scan_ranges_parallel(
 def plot_top_k(
     df: pd.DataFrame,
     actual_spec_arrays: np.ndarray,
-    windows: List[Tuple[int, int]],
+    # windows (native coords, inclusive)
+    windows_masked: List[Tuple[int, int]],
+    windows_unmasked: List[Tuple[int, int]],
+    windows_fixed: List[Tuple[int, int]],
+    # scores
+    scores_masked: List[float],
+    scores_unmasked: List[float],
+    scores_fixed: List[float],
+    # overlap stats (fractions in 0..1 and counts) for unmasked + fixed
+    overlap_unmasked_pct: List[float] | None,
+    overlap_fixed_pct:    List[float] | None,
+    # misc/meta
     atm_interfs: List[List[Tuple[int, int]]],
-    scores: List[float],
     meta: Dict[str, Any],
     ws: List[int],
+    # viz/IO
     k: int = 10,
     per_fig: int = 10,
     buffer: int = 10,
     out_dir: str = "Images",
     data_dir: str = "Data",
-    sra_preds: List[np.ndarray] | None = None,
-    sri_idxs: List[np.ndarray | None] | None = None,
-    sri_vals: List[np.ndarray | None] | None = None,
+    # predictions
+    sra_preds: List[np.ndarray] | None = None,  # shared SRA (trimmed) per row
+    sri_idxs_masked:  List[np.ndarray | None] | None = None,
+    sri_vals_masked:  List[np.ndarray | None] | None = None,
+    sri_idxs_unmasked:List[np.ndarray | None] | None = None,
+    sri_vals_unmasked:List[np.ndarray | None] | None = None,
+    sri_idxs_fixed:   List[np.ndarray | None] | None = None,
+    sri_vals_fixed:   List[np.ndarray | None] | None = None,
     sr_factor: int = 1,
+    fixed_bins_nat: List[int] | None = None,
+    # ranking
+    rank_by: str = "masked",  # "masked" | "unmasked" | "fixed"
 ) -> None:
-    """Save ranked CSV and plot top-K rows with overlays.
+    """Save ranked CSV and plot top-K rows with three window overlays.
+
+    Ranks rows by `rank_by` score, but CSV contains all windows/scores/overlaps.
 
     Args:
       df: Source dataframe (must contain 'uid').
       actual_spec_arrays: (N,L) spectra at native resolution.
-      windows: best windows at native resolution.
+      windows_*: best windows at native resolution for each scan type.
+      scores_*: scores for each scan type.
+      overlap_*: overlap stats (only used/available for unmasked and fixed).
       atm_interfs: interference ranges at native resolution.
-      scores: ranking scores (higher is better).
       meta: dict with 'uid', 'ref', 'ant', 'pol', 'freq' arrays.
       ws: effective kernel sizes (native scale).
-      k: top-K to plot (and include in summary CSV tail).
-      per_fig: number of rows per PNG figure.
-      buffer: native buffer used at plotting time.
-      out_dir: directory to emit figures.
-      data_dir: directory to emit CSV.
-      sra_preds: list of NWKR predictions for (trimmed SR) rows (optional).
-      sri_idxs: list of index arrays for inside-window predictions (optional).
-      sri_vals: list of predicted values for inside-window indices (optional).
-      sr_factor: upsampling factor to map SR predictions back to native.
+      k, per_fig, buffer, out_dir, data_dir: plotting/IO knobs.
+      sra_preds: NWKR predictions on trimmed SR rows (for overlay).
+      sri_idxs_*/sri_vals_*: per-window inside predictions (optional overlays).
+      sr_factor: SR upsampling for SRA/SRI overlays.
+      fixed_bins_nat: optional native bin length for fixed windows (diagnostic).
+      rank_by: which score to rank by: "masked" | "unmasked" | "fixed".
     """
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
     buf_orig = buffer
 
-    scores_np = np.asarray(scores, dtype=float)
-    finite = np.isfinite(scores_np)
-    indexes = np.where(finite)[0]
-    top_all = indexes[np.argsort(scores_np[finite])[:]][::-1]
+    # Choose score vector for ranking
+    score_map_all = {
+        "masked":   np.asarray(scores_masked, dtype=float),
+        "unmasked": np.asarray(scores_unmasked, dtype=float),
+        "fixed":    np.asarray(scores_fixed, dtype=float),
+    }
+    if rank_by not in score_map_all:
+        raise ValueError("rank_by must be one of: 'masked', 'unmasked', 'fixed'")
+    scores_rank = score_map_all[rank_by]
 
-    top_uids = np.asarray(meta["uid"])[top_all]
-    top_scores = scores_np[top_all]
-    top_windows = np.asarray(windows, dtype=object)[top_all]
-    top_ws = np.asarray(ws, dtype=object)[top_all]
+    # Top ordering (desc)
+    finite = np.isfinite(scores_rank)
+    idx_all = np.where(finite)[0]
+    order_desc = idx_all[np.argsort(scores_rank[finite])[:]][::-1]
+
+    # Build CSV (for *all* rows in the filtered ordering)
+    top_uids = np.asarray(meta["uid"])[order_desc]
+    kernel_sizes = np.asarray(ws, dtype=object)[order_desc]
 
     sub_df = df.loc[df["uid"].isin(top_uids)].copy()
-    score_map = dict(zip(top_uids, top_scores))
-    window_map = dict(zip(top_uids, top_windows))
-    kernel_map = dict(zip(top_uids, top_ws))
 
-    sub_df["score"] = sub_df["uid"].map(score_map)
-    sub_df["kernel_size"] = sub_df["uid"].map(kernel_map)
-    sub_df[["win_start", "win_end"]] = sub_df["uid"].map(window_map).apply(pd.Series)
-    sub_df = sub_df.sort_values("score", ascending=False).reset_index(drop=True)
+    # Map all columns by uid
+    def _mk_map(vec): return dict(zip(top_uids, np.asarray(vec, dtype=object)[order_desc]))
+
+    sub_df["score_masked"]   = sub_df["uid"].map(_mk_map(scores_masked))
+    sub_df["score_unmasked"] = sub_df["uid"].map(_mk_map(scores_unmasked))
+    sub_df["score_fixed"]    = sub_df["uid"].map(_mk_map(scores_fixed))
+    sub_df["kernel_size"]    = sub_df["uid"].map(_mk_map(kernel_sizes))
+
+    # Windows
+    sub_df[["win_masked_start", "win_masked_end"]]     = sub_df["uid"].map(_mk_map(windows_masked)).apply(pd.Series)
+    sub_df[["win_unmasked_start", "win_unmasked_end"]] = sub_df["uid"].map(_mk_map(windows_unmasked)).apply(pd.Series)
+    sub_df[["win_fixed_start", "win_fixed_end"]]       = sub_df["uid"].map(_mk_map(windows_fixed)).apply(pd.Series)
+
+    # Overlaps (optional)
+    if overlap_unmasked_pct is not None:
+        sub_df["overlap_unmasked_pct"] = sub_df["uid"].map(_mk_map(overlap_unmasked_pct))
+    if overlap_fixed_pct is not None:
+        sub_df["overlap_fixed_pct"] = sub_df["uid"].map(_mk_map(overlap_fixed_pct))
+    if fixed_bins_nat is not None:
+        sub_df["fixed_bins_native"] = sub_df["uid"].map(_mk_map(fixed_bins_nat))
+
+    # Sort by chosen score
+    sub_df["rank_score"] = sub_df["uid"].map(_mk_map(scores_rank))
+    sub_df = sub_df.sort_values("rank_score", ascending=False).reset_index(drop=True)
     sub_df.insert(0, "uid", sub_df.pop("uid"))
 
     out_csv = os.path.join(
@@ -660,71 +795,123 @@ def plot_top_k(
         f"bandpass_qa0_no_partitions_labelled_filt_scan_stat_length_{actual_spec_arrays.shape[1]}.csv",
     )
     sub_df.to_csv(out_csv, index=False)
-    logging.info("Wrote summary CSV: %s", out_csv)
+    logging.info("Wrote summary CSV (all windows): %s", out_csv)
 
-    # Slice top-k for plotting
-    top = indexes[np.argsort(scores_np[finite])[-k:]][::-1]
-    df_slice = df.iloc[top].copy()
-    df_slice["orig_idx"] = top
-    df_slice["score"] = scores_np[top]
-    df_slice["kernel_size"] = [ws[i] for i in top]
-    df_slice["win_start"] = [windows[i][0] for i in top]
-    df_slice["win_end"] = [windows[i][1] for i in top]
-
-    n_figs = math.ceil(len(df_slice) / per_fig)
+    # ---- Plot top-k with all windows overlaid ----
+    top = order_desc[:min(k, len(order_desc))]
+    n_figs = math.ceil(len(top) / per_fig)
     for fig_i in range(n_figs):
-        chunk = df_slice.iloc[fig_i * per_fig : (fig_i + 1) * per_fig]
-        fig_k = len(chunk)
+        batch = top[fig_i * per_fig : (fig_i + 1) * per_fig]
+        fig_k = len(batch)
         fig, axes = plt.subplots(fig_k, 1, figsize=(10, 3 * fig_k))
         if fig_k == 1:
             axes = [axes]
 
-        for ax, row in zip(axes, chunk.itertuples()):
-            i0 = row.orig_idx
+        for ax, i0 in zip(axes, batch):
             spec = actual_spec_arrays[i0]
-            a, b = row.win_start, row.win_end
+            a_m, b_m = windows_masked[i0]
+            a_u, b_u = windows_unmasked[i0]
+            a_f, b_f = windows_fixed[i0]
 
+            # Atmospheric interference shading
             for (c, d) in atm_interfs[i0]:
-                ax.axvspan(c, d, color="C9", alpha=0.2)
+                ax.axvspan(c, d, color="C9", alpha=0.15, label=None)
 
+            # Raw spectrum
             x = np.arange(len(spec))
             ax.plot(x, spec, color="C0", label="Actual")
 
+            # Buffer shading
             if buf_orig > 0:
-                ax.axvspan(0, buf_orig - 1, color="gray", alpha=0.2)
-                ax.axvspan(len(spec) - buf_orig, len(spec) - 1, color="gray", alpha=0.2)
+                ax.axvspan(0, buf_orig - 1, color="gray", alpha=0.15, label=None)
+                ax.axvspan(len(spec) - buf_orig, len(spec) - 1, color="gray", alpha=0.15, label=None)
 
-            ax.axvspan(a, b, color="C1", alpha=0.3)
+            # Window overlays (distinct alphas)
+            ax.axvspan(a_m, b_m, color="C1", alpha=0.35, label=None)
+            ax.axvspan(a_u, b_u, color="C2", alpha=0.25, label=None)
+            ax.axvspan(a_f, b_f, color="C3", alpha=0.25, label=None)
 
+            # SRA predicted curve (shared)
             if sra_preds is not None and sra_preds[i0] is not None and len(sra_preds[i0]) > 0:
                 pred_full = np.full(len(spec), np.nan)
-                sra_sr = sra_preds[i0]
-                sra_up = np.repeat(sra_sr, sr_factor)
+                sra_up = np.repeat(sra_preds[i0], sr_factor)
                 end = len(spec) - buf_orig
                 pred_full[buf_orig:end] = sra_up[: max(0, end - buf_orig)]
                 ax.plot(np.arange(len(spec)), pred_full, ".", ms=2, label="SRA pred")
 
-            if (sri_idxs is not None) and (sri_vals is not None) and (sri_idxs[i0] is not None):
+            # SRI overlays per window (optional)
+            def _plot_sri(idx_list, val_list, label: str):
+                if (idx_list is None) or (val_list is None):
+                    return
+                if (idx_list[i0] is None) or (val_list[i0] is None):
+                    return
                 sri_full = np.full(len(spec), np.nan)
-                idx_sr = np.asarray(sri_idxs[i0], dtype=int)
-                val_sr = np.asarray(sri_vals[i0], dtype=float)
+                idx_sr  = np.asarray(idx_list[i0], dtype=int)
+                val_sr  = np.asarray(val_list[i0], dtype=float)
                 idx_orig_start = idx_sr * sr_factor
                 for p, v in zip(idx_orig_start, val_sr):
                     p_end = min(p + sr_factor, len(spec))
                     sri_full[p:p_end] = v
-                ax.plot(np.arange(len(spec)), sri_full, ".", ms=2, label="SRI pred")
+                ax.plot(np.arange(len(spec)), sri_full, ".", ms=2, label=label)
 
-            ax.set_title(
-                f"UID={row.orig_idx}  Score={row.score:.2f}  "
-                f"Range=[{a},{b}] Kernel size={row.kernel_size}"
-            )
+            _plot_sri(sri_idxs_masked,   sri_vals_masked,   "SRI masked")
+            _plot_sri(sri_idxs_unmasked, sri_vals_unmasked, "SRI unmasked")
+            _plot_sri(sri_idxs_fixed,    sri_vals_fixed,    "SRI fixed")
+
+            # Title with all scores (+overlaps if available)
+            parts = [
+                f"UID={i0}",
+                f"S_masked={scores_masked[i0]:.2f}",
+                f"S_unmasked={scores_unmasked[i0]:.2f}",
+                f"S_fixed={scores_fixed[i0]:.2f}",
+            ]
+            if overlap_unmasked_pct is not None:
+                parts.append(f"ovl_unm={100*overlap_unmasked_pct[i0]:.1f}%")
+            if overlap_fixed_pct is not None:
+                parts.append(f"ovl_fix={100*overlap_fixed_pct[i0]:.1f}%")
+            if fixed_bins_nat is not None:
+                parts.append(f"fixed_bins={fixed_bins_nat[i0]}")
+            parts.append(f"W={ws[i0]}")
+            ax.set_title("  ".join(parts))
+
             ax.set_xlabel("Channel")
             ax.set_ylabel("Amplitude")
-            ax.legend()
 
-        plt.tight_layout(rect=[0, 0, 1, 0.92])
-        plt.suptitle(f"Items {fig_i * per_fig + 1}–{fig_i * per_fig + fig_k} of Top {k}", y=0.98)
-        outpath = os.path.join(out_dir, f"top_{k}_fig{fig_i + 1}.png")
+        legend_elements = [
+            Line2D([0], [0], color="C0", label="Actual"),
+            Line2D([0], [0], marker=".", linestyle="None", label="SRA pred"),
+            Line2D([0], [0], marker=".", linestyle="None", label="SRI masked"),
+            Line2D([0], [0], marker=".", linestyle="None", label="SRI unmasked"),
+            Line2D([0], [0], marker=".", linestyle="None", label="SRI fixed"),
+            Patch(facecolor="C1", alpha=0.35, label="Masked window"),
+            Patch(facecolor="C2", alpha=0.25, label="Unmasked window"),
+            Patch(facecolor="C3", alpha=0.25, label="Fixed window"),
+            Patch(facecolor="C9", alpha=0.15, label="Interference"),
+            Patch(facecolor="gray", alpha=0.15, label="Buffer"),
+        ]
+
+        # Let tight_layout do its thing for subplots first
+        plt.tight_layout()
+
+        # Add a compact legend just below the top edge (inside the figure box)
+        fig.legend(
+            handles=legend_elements,
+            loc="upper center",
+            ncol=5,
+            frameon=True,
+            bbox_to_anchor=(0.5, 0.985),  # pull this down if you still see crowding
+        )
+
+        # Now reclaim top space but keep a little headroom for legend + title
+        fig.subplots_adjust(top=0.92)  # try 0.92–0.95 depending on your fonts
+
+        # Keep the title but don’t push everything down
+        fig.suptitle(
+            f"Top {min(k, len(order_desc))} ranked by {rank_by} — batch {fig_i+1}/{n_figs}",
+            y=0.995
+        )
+
+        outpath = os.path.join(out_dir, f"top_{min(k, len(order_desc))}_by_{rank_by}_fig{fig_i + 1}.png")
         plt.savefig(outpath, dpi=300, bbox_inches="tight")
         plt.close(fig)
         logging.info("Wrote figure: %s", outpath)
@@ -785,79 +972,119 @@ def superresolve(specs: np.ndarray, factor: int) -> np.ndarray:
     return trimmed.reshape(n_rows, n_blk, factor).mean(axis=2)
 
 
-def refine_windows_exact_for_length(
+def refine_all_windows_exact_for_length(
     spec_arrays: np.ndarray,
-    windows_sr: List[Tuple[int, int]],
-    atm_interfs: List[List[Tuple[int, int]]],
+    windows_masked_sr: List[Tuple[int, int]],
+    windows_unmasked_sr: List[Tuple[int, int]],
+    windows_fixed_sr: List[Tuple[int, int]],
+    atm_interfs: List[List[Tuple[int,int]]],
     ws: List[int],
     range_caps: List[int],
     sr_factor: int,
     buffer: int,
-) -> List[Tuple[int, int]]:
-    """Refine coarse (SR) windows on the native-resolution spectra.
+) -> Tuple[List[Tuple[int,int]], List[Tuple[int,int]], List[Tuple[int,int]]]:
+    """Refine all coarse (SR) windows on native-resolution spectra.
 
-    Args:
-      spec_arrays: (N,L) native-resolution spectra.
-      windows_sr: list of (start,end) on SR grid (inclusive).
-      atm_interfs: native-resolution interference ranges.
-      ws: per-row kernel sizes to use at native resolution.
-      range_caps: per-row range caps (native scale).
-      sr_factor: SR factor used in coarse step.
-      buffer: native-resolution buffer trimmed at plotting/scoring time.
+    Inputs:
+      spec_arrays        : (N, L_native)
+      windows_masked_sr  : best var-len windows on SR grid (masked scan), len N
+      windows_unmasked_sr: best var-len windows on SR grid (unmasked scan), len N
+      windows_fixed_sr   : best fixed-len windows on SR grid (unmasked fixed scan), len N
+      atm_interfs        : per-row native interference ranges [(s,e), ...]
+      ws, range_caps     : per-row kernel size and range cap (both in native scale;
+                           i.e., returned as w*sr_factor and range_cap*sr_factor by the SR scan)
+      sr_factor          : SR block size used to produce the coarse windows
+      buffer             : native channels trimmed on both sides for scoring
 
     Returns:
-      List of (start,end) at native resolution for each row.
+      (windows_masked_exact, windows_unmasked_exact, windows_fixed_exact)
+      — each a list of (start,end) in native coordinates (inclusive), length N.
     """
-    n_rows, n_ch = spec_arrays.shape
-    n_trimmed = n_ch - 2 * buffer
+    N, L = spec_arrays.shape
+    n_trimmed = L - 2 * buffer
     if n_trimmed <= 0:
-        return [(0, 0)] * n_rows
+        z = [(0, 0)] * N
+        return z, z, z
 
-    refined: List[Tuple[int, int]] = []
+    out_masked   : List[Tuple[int,int]] = []
+    out_unmasked : List[Tuple[int,int]] = []
+    out_fixed    : List[Tuple[int,int]] = []
 
-    for i in range(n_rows):
-        W_trimmed = _get_kernel(n_trimmed, ws[i])
-        range_cap = range_caps[i]
-        row_trimmed = spec_arrays[i, buffer: n_ch - buffer]
+    for i in range(N):
+        W_trimmed = _get_kernel(n_trimmed, ws[i])      # ws[i] is native-scale
+        range_cap = range_caps[i]                      # native-scale
+        row_trimmed = spec_arrays[i, buffer:L-buffer]
 
         sra, ssr_array, _ = calculate_nwkr_sra(row_trimmed, W_trimmed)
         sra = sra if sra > 1e-12 else 1e-12
 
-        # Build valid index mask
+        # Build native valid mask for masked refinement
         mask = np.ones(n_trimmed, dtype=np.bool_)
         for (s, e) in atm_interfs[i]:
             s0 = max(s - buffer, 0)
             e0 = min(e - buffer, n_trimmed - 1)
             if s0 <= e0:
-                mask[s0:e0 + 1] = False
-        valid = np.nonzero(mask)[0]
+                mask[s0:e0+1] = False
+        valid_all = np.arange(n_trimmed, dtype=np.int64)
+        valid_masked = valid_all[mask]
 
-        x_sr, y_sr = windows_sr[i]
-        a_lo = max(x_sr * sr_factor - buffer, 0)
-        a_hi = min((x_sr + 1) * sr_factor - 1 - buffer, n_trimmed - 1)
-        b_lo = max(y_sr * sr_factor - buffer, 0)
-        b_hi = min((y_sr + 1) * sr_factor - 1 - buffer, n_trimmed - 1)
+        # ---- helpers ----
+        def _score_varlen(a: int, b: int, valid: np.ndarray) -> float:
+            # contiguous inside over [a,b] intersected with valid
+            inside = valid[(valid >= a) & (valid <= b)]
+            if inside.size == 0:
+                return -np.inf
+            outside = np.setdiff1d(valid_all, inside, assume_unique=False)
+            sc = score_variance_nwkr(row_trimmed, inside, outside, a, b, range_cap, W_trimmed, ssr_array)
+            return sc / sra + 1.0
 
-        best_sc = -np.inf
-        best_ab = (x_sr, y_sr)
+        def _refine_varlen_from_sr(x_sr: int, y_sr: int, valid: np.ndarray) -> Tuple[int,int]:
+            # SR -> native candidate box
+            a_lo = max(x_sr * sr_factor - buffer, 0)
+            a_hi = min((x_sr + 1) * sr_factor - 1 - buffer, n_trimmed - 1)
+            b_lo = max(y_sr * sr_factor - buffer, 0)
+            b_hi = min((y_sr + 1) * sr_factor - 1 - buffer, n_trimmed - 1)
 
-        for a in range(a_lo, a_hi + 1):
-            start_b = max(a, b_lo)
-            for b in range(start_b, b_hi + 1):
-                inside = valid[(valid >= a) & (valid <= b)]
-                if inside.size == 0:
-                    continue
-                outside = np.setdiff1d(valid, inside, assume_unique=False)
-                sc = score_variance_nwkr(row_trimmed, inside, outside, a, b, range_cap, W_trimmed, ssr_array)
-                sc = sc / sra + 1.0
+            best_sc, best_ab = -np.inf, (a_lo, max(a_lo, b_lo))
+            for a in range(a_lo, a_hi + 1):
+                b_start = max(a, b_lo)
+                for b in range(b_start, b_hi + 1):
+                    sc = _score_varlen(a, b, valid)
+                    if sc > best_sc:
+                        best_sc, best_ab = sc, (a, b)
+            a_t, b_t = best_ab
+            return (a_t + buffer, b_t + buffer)  # back to native coords
+
+        def _refine_fixed_from_sr(x_sr: int, y_sr: int) -> Tuple[int,int]:
+            # fixed window native length
+            fixed_bins_native = (y_sr - x_sr + 1) * sr_factor
+            fixed_bins_native = max(1, min(fixed_bins_native, n_trimmed))
+
+            # derive feasible a range from SR box; enforce fixed len
+            a_lo = max(x_sr * sr_factor - buffer, 0)
+            a_hi = min((x_sr + 1) * sr_factor - 1 - buffer, n_trimmed - fixed_bins_native)
+            b_from_a = lambda a: a + fixed_bins_native - 1
+
+            best_sc, best_a = -np.inf, a_lo
+            for a in range(a_lo, a_hi + 1):
+                b = b_from_a(a)
+                # unmasked fixed refinement: use all valid indices
+                sc = _score_varlen(a, b, valid_all)
                 if sc > best_sc:
-                    best_sc = sc
-                    best_ab = (a, b)
+                    best_sc, best_a = sc, a
+            a_t, b_t = best_a, b_from_a(best_a)
+            return (a_t + buffer, b_t + buffer)
 
-        a_t, b_t = best_ab
-        refined.append((a_t + buffer, b_t + buffer))
+        # ---- refine each coarse window ----
+        xm, ym = windows_masked_sr[i]
+        xu, yu = windows_unmasked_sr[i]
+        xf, yf = windows_fixed_sr[i]
 
-    return refined
+        out_masked.append(_refine_varlen_from_sr(xm, ym, valid_masked))
+        out_unmasked.append(_refine_varlen_from_sr(xu, yu, valid_all))
+        out_fixed.append(_refine_fixed_from_sr(xf, yf))
+
+    return out_masked, out_unmasked, out_fixed
 
 
 # -----------------------------------------------------------------------------#
@@ -915,7 +1142,10 @@ def main() -> None:
         meta = {"uid": uid, "ref": ref, "ant": ant, "pol": pol, "freq": freqs}
 
         t2 = time.perf_counter()
-        windows_sr, scores, sra_preds, sri_idxs, sri_vals, ws, range_caps = polynomial_scan_ranges_parallel(
+        (windows_sr_masked, scores_masked, sra_preds, sri_idxs, sri_vals, ws, range_caps,
+        windows_sr_unmasked, scores_unmasked, overlap_unm_pct, sri_idxs_unm, sri_vals_unm,
+        windows_sr_fixed, scores_fixed, overlap_fix_pct, sri_idxs_fix, sri_vals_fix, fixed_bins_nat
+        ) = polynomial_scan_ranges_parallel(
             spec_arrays=actual_specs_sr,
             score_fn=_scan_row,
             atm_interfs=atm_interfs_sr,
@@ -933,18 +1163,34 @@ def main() -> None:
         os.makedirs(data_dir, exist_ok=True)
 
         if SR_FACTOR > 1:
-            windows_exact = refine_windows_exact_for_length(
-                actual_specs, windows_sr, atm_interfs, ws, range_caps, SR_FACTOR, BUFFER
+            windows_exact_masked, windows_exact_unmasked, windows_exact_fixed = refine_all_windows_exact_for_length(
+                actual_specs,
+                windows_sr_masked,
+                windows_sr_unmasked,
+                windows_sr_fixed,
+                atm_interfs,
+                ws,
+                range_caps,
+                SR_FACTOR,
+                BUFFER,
             )
         else:
-            windows_exact = windows_sr
+            windows_exact_masked   = windows_sr_masked
+            windows_exact_unmasked = windows_sr_unmasked
+            windows_exact_fixed    = windows_sr_fixed
 
         plot_top_k(
             df=df,
             actual_spec_arrays=actual_specs,
-            windows=windows_exact,
+            windows_masked=windows_exact_masked,
+            windows_unmasked=windows_exact_unmasked,
+            windows_fixed=windows_exact_fixed,
+            scores_masked=scores_masked,
+            scores_unmasked=scores_unmasked,
+            scores_fixed=scores_fixed,
+            overlap_unmasked_pct=overlap_unm_pct,
+            overlap_fixed_pct=overlap_fix_pct,
             atm_interfs=atm_interfs,
-            scores=scores,
             meta=meta,
             ws=ws,
             k=min(args.top_k, n_rows),
@@ -953,9 +1199,15 @@ def main() -> None:
             out_dir=out_dir,
             data_dir=data_dir,
             sra_preds=sra_preds,
-            sri_idxs=sri_idxs,
-            sri_vals=sri_vals,
+            sri_idxs_masked=sri_idxs,
+            sri_vals_masked=sri_vals,
+            sri_idxs_unmasked=sri_idxs_unm,
+            sri_vals_unmasked=sri_vals_unm,
+            sri_idxs_fixed=sri_idxs_fix,
+            sri_vals_fixed=sri_vals_fix,
             sr_factor=SR_FACTOR,
+            fixed_bins_nat=fixed_bins_nat,
+            rank_by="masked",
         )
 
 

@@ -28,8 +28,8 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 import ast
 
-KEYS  = ["eb_uid", "antenna", "polarization", "spw_name_ms","win_start","win_end"]
-KEEP  = KEYS + ["score", "segment_width", "qa2flag","win_chans"]
+KEYS  = ["eb_uid", "antenna", "polarization", "spw_name_ms", "score_masked", "score_unmasked", "score_fixed", "kernel_size", "win_masked_start", "win_masked_end",	"win_unmasked_start", "win_unmasked_end", "win_fixed_start", "win_fixed_end", "overlap_unmasked_pct", "overlap_fixed_pct", "fixed_bins_native"]
+KEEP  = KEYS + ["segment_width", "qa2flag", "win_chans"]
 
 # ------------------------------------------------------------------
 # Priority QA2 flags → qa2flag = 1
@@ -135,8 +135,8 @@ def main(argv=None):
 
     # 1 – segment_width in MHz. freq axis is actually in Hz...
     df["delta_GHz"]      = df["frequency_array"].apply(channel_spacing)
-    df["win_chans"] = (df["win_end"]-df["win_start"]).abs().astype(int)
-    df["segment_width"]  = (df["win_end"] - df["win_start"]).abs() * df["delta_GHz"] /1e6
+    df["win_chans"] = (df["win_masked_end"]-df["win_masked_start"]).abs().astype(int)
+    df["segment_width"]  = (df["win_masked_end"] - df["win_masked_start"]).abs() * df["delta_GHz"] /1e6
 
     # 2 – qa2flag code
     df["qa2flag"] = df["QA2 Flag(s)"].apply(qa2_flag_code)
@@ -158,25 +158,36 @@ def main(argv=None):
 
     # 5 – scatter plot
     # ---- create 1) segment-width and 2) win_chans scatter plots ---------
+    png1 = Path(args.png).with_name(Path(args.png).stem + "_masked" + Path(args.png).suffix)
     fig1, ax1 = plt.subplots(figsize=(7, 4.5))
     scatter(ax1,
-        out["segment_width"], out["score"], out["qa2flag"],
-        "Segment-width vs score", "segment_width  [MHz]")
+        out["segment_width"], out["score_masked"], out["qa2flag"],
+        "Segment-width vs Score Masked", "segment_width  [MHz]")
     fig1.tight_layout()
     fig1.savefig(args.png, dpi=180)
     plt.close(fig1)
 
-    png2 = Path(args.png).with_name(Path(args.png).stem + "_chans" + Path(args.png).suffix)
+    png2 = Path(args.png).with_name(Path(args.png).stem + "_unmasked" + Path(args.png).suffix)
     fig2, ax2 = plt.subplots(figsize=(7, 4.5))
     scatter(ax2,
-        out["win_chans"], out["score"], out["qa2flag"],
-        "Win-channels vs score", "win_chans  [channels]")
+        out["segment_width"], out["score_unmasked"], out["qa2flag"],
+        "Segment-width vs Score Unmasked", "segment_width  [MHz]")
     fig2.tight_layout()
     fig2.savefig(png2, dpi=180)
     plt.close(fig2)
 
-    print(f"✅  plot saved → {Path(args.png).resolve()}")
+    png3 = Path(args.png).with_name(Path(args.png).stem + "_fixed" + Path(args.png).suffix)
+    fig3, ax3 = plt.subplots(figsize=(7, 4.5))
+    scatter(ax3,
+        out["segment_width"], out["score_fixed"], out["qa2flag"],
+        "Segment-width vs Score Fixed", "segment_width  [MHz]")
+    fig3.tight_layout()
+    fig3.savefig(png3, dpi=180)
+    plt.close(fig3)
+
+    print(f"✅  plot saved → {png1.resolve()}")
     print(f"✅  plot saved → {png2.resolve()}")
+    print(f"✅  plot saved → {png3.resolve()}")
 
 
 if __name__ == "__main__":
