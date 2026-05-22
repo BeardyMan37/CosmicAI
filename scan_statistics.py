@@ -1,68 +1,11 @@
 """
-Single-file modular implementation of the CosmicAI NWKR scan statistics pipeline.
-
-Sections
---------
-  1.  Imports & constants
-  2.  Public types          (Input, Output)
-  3.  Atmospheric detection (load_transmission, detect_atm_ranges)
-  4.  SR / superresolution  (_sr_factor, _superresolve, ...)
-  5.  Kernel primitives     (_truncated_kernel_vector, _calculate_gaussian_sra_trunc)
-  6.  Numba JIT state       (_is_inside, _nin_din_*, _sse_out_*, _buf_*)
-  7.  Core scan             (_scan_single_row)
-  8.  Public API            (compute_scan_statistics_scores)
-  9.  CLI runner            (main)
+scan_statistics.py
+==================
+Self-contained NWKR scan statistics pipeline for spectral line detection
+in ALMA bandpass calibration data.
 
 Library usage
 -------------
-    from scan_statistics_runner import compute_scan_statistics_scores, Input, Output
-
-    results = compute_scan_statistics_scores({
-        "key": Input(amplitude=amp, frequency=freq, flag_array=flags,
-                     atm_ranges=[(s1,e1), (s2,e2)])
-    })
-    out = results["key"]["masked"]
-    print(out.score, out.win_start, out.win_end)
-
-CLI usage
----------
-    python scan_statistics_runner.py \
-        --amplitude  amp.npy \
-        --frequency  freq.npy \
-        --interference full_spectrum.gzip \
-        --key my_baseline
-
-    # with optional flag array:
-    python scan_statistics_runner.py \
-        --amplitude  amp.npy \
-        --frequency  freq.npy \
-        --flag-array flags.npy \
-        --interference full_spectrum.gzip \
-        --key my_baseline
-
-Arguments
----------
-    --amplitude     (required) .npy file, 1-D float64 amplitude array.
-    --frequency     (required) .npy file, 1-D float64 frequency array in GHz.
-    --flag-array    (optional) .npy file, 1-D bool array (True = flagged).
-                    Defaults to all-False if omitted.
-    --interference  (optional) Transmission parquet/gzip file with columns
-                    "Frequency (GHz)" and "Transmission (%)".
-                    Used to detect atmospheric absorption line ranges.
-                    If omitted, atm_ranges is empty.
-    --key           Label for this spectrum (default: "spectrum").
-    --kernel        "gaussian" (default) or "laplace".
-    --log-level     Logging verbosity (default: INFO).
-scan_statistics.py
-Public entry point for computing NWKR-based scan statistics on batched
-bandpass calibration inputs.
-
-This module is self-contained: it does not import from ``cosmicai``.
-All core logic is re-implemented here to be dependency-free, but the
-algorithm is identical to ``cosmicai.scan.scan_row_with_nwkr``.
-
-Usage
------
     from scan_statistics import compute_scan_statistics_scores, Input, Output
 
     results = compute_scan_statistics_scores({
@@ -74,26 +17,36 @@ Usage
 
 from __future__ import annotations
 
+import argparse
 import math
 import logging
 from itertools import groupby
-from typing import Dict, List, Literal, NamedTuple, Tuple, TypeAlias
+from typing import Dict, List, Literal, NamedTuple, Optional, Tuple, TypeAlias
 
 import numpy as np
+from numba import njit
 
-# ---------------------------------------------------------------------------
-# Public types
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 1. Constants
+# ===========================================================================
+
+_REF_FREQ: float = 0.0625          # GHz — reference spectral-line channel width
+_BUFFER_DIVISOR: int = 20          # buffer = len(frequency) // _BUFFER_DIVISOR
+_DEFAULT_KERNEL: str = "gaussian"
+_SUPER_RESOLVE_BASE: int = 450     # spectra longer than this get superresolved
+
+logger = logging.getLogger(__name__)
+
+# ===========================================================================
+# 2. Public types
+# ===========================================================================
 
 class Input(NamedTuple):
     """Input data for a single bandpass calibration solution."""
-    # Amplitude values (1D array)
     amplitude: np.ndarray
-    # Frequency values (1D array)
     frequency: np.ndarray
-    # 1D Boolean array of flags, same length as amplitude;
-    # True denotes a flagged (excluded) channel.
     flag_array: np.ndarray
+    atm_ranges: Optional[List[Tuple[int, int]]] = None
 
 
 class Output(NamedTuple):
@@ -101,27 +54,1047 @@ class Output(NamedTuple):
     score: float
     win_start: int
     win_end: int
+    overlap_pct: float = 0.0
 
 
 ScanMode: TypeAlias = Literal["masked", "unmasked", "fixed"]
 ScanResult: TypeAlias = Dict[ScanMode, Output]
 
-# ---------------------------------------------------------------------------
-# Internal constants  (mirror cosmicai/config.py)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. Atmospheric detection
+# ===========================================================================
 
-_REF_FREQ: float = 0.0625       # GHz — reference spectral-line channel width
-_BUFFER_DIVISOR: int = 20       # buffer = len(frequency) // _BUFFER_DIVISOR
-_DEFAULT_KERNEL: str = "gaussian"
+def load_transmission(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load an atmospheric transmission table from parquet."""
+    try:
+        import pandas as pd
+    except ImportError:
+        raise ImportError("pandas is required for loading transmission tables.")
+    df = pd.read_parquet(path)
+    freqs = df["Frequency (GHz)"].to_numpy(dtype=np.float64)
+    vals = df["Transmission (%)"].to_numpy(dtype=np.float64)
+    order = np.argsort(freqs)
+    return freqs[order], vals[order]
 
-logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Helpers: flag array → index ranges
-# ---------------------------------------------------------------------------
+def detect_atm_ranges(
+    freq_array: np.ndarray,
+    trans_freqs: np.ndarray,
+    trans_vals: np.ndarray,
+    prominence: float = 1.0,
+    rel_height: float = 0.75,
+) -> List[Tuple[int, int]]:
+    """Detect atmospheric absorption ranges by finding troughs in matched transmission."""
+    try:
+        from scipy.signal import find_peaks, peak_widths
+    except ImportError:
+        raise ImportError("scipy is required for atmospheric detection.")
+
+    freq_array = np.asarray(freq_array, dtype=np.float64)
+    idxs = np.clip(np.searchsorted(trans_freqs, freq_array), 0, len(trans_freqs) - 1)
+    left = np.maximum(idxs - 1, 0)
+    right = idxs
+    dl = np.abs(freq_array - trans_freqs[left])
+    dr = np.abs(trans_freqs[right] - freq_array)
+    nearest = np.where(dl <= dr, left, right)
+    trans_matched = trans_vals[nearest]
+
+    troughs, _ = find_peaks(-trans_matched, prominence=prominence)
+    if len(troughs) == 0:
+        return []
+
+    _, _, left_ips, right_ips = peak_widths(-trans_matched, troughs, rel_height=rel_height)
+    freqs = freq_array
+    left_freqs = np.interp(left_ips, np.arange(len(freqs)), freqs)
+    right_freqs = np.interp(right_ips, np.arange(len(freqs)), freqs)
+    widths_freq = right_freqs - left_freqs
+    trough_freqs = freqs[troughs]
+    trough_ranges = np.column_stack(
+        (trough_freqs - widths_freq / 2.0, trough_freqs + widths_freq / 2.0)
+    )
+
+    ranges: List[Tuple[int, int]] = []
+    for start_f, end_f in trough_ranges:
+        s_idx = int(np.abs(freqs - start_f).argmin())
+        e_idx = int(np.abs(freqs - end_f).argmin())
+        ranges.append((min(s_idx, e_idx), max(s_idx, e_idx)))
+    return ranges
+
+
+# ===========================================================================
+# 4. Superresolution
+# ===========================================================================
+
+def _sr_factor(L: int, base: int = _SUPER_RESOLVE_BASE, r: int = 2, q: int = 2, cap=None) -> int:
+    """
+    Compute superresolution downsampling factor.
+    """
+    s = math.ceil((L + 1) / base)
+    k = math.ceil(math.log(s, r)) if s > 1 else 0
+    f = q ** k
+    return min(f, cap) if cap is not None else f
+
+
+def _superresolve(specs: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Downsample a 2-D array (n_rows × n_ch) by averaging blocks of `factor`
+    channels.
+
+    Input must be 2-D.  Trailing channels that don't fill a block are dropped.
+    """
+    if factor < 1:
+        raise ValueError("factor must be >= 1")
+    n_rows, n_ch = specs.shape
+    n_blk = n_ch // factor
+    if n_blk == 0:
+        return np.empty((n_rows, 0), dtype=specs.dtype)
+    trimmed = specs[:, :n_blk * factor]
+    return trimmed.reshape(n_rows, n_blk, factor).mean(axis=2)
+
+
+def _superresolve_ranges(
+    ranges_list: List[List[Tuple[int, int]]], factor: int,
+) -> List[List[Tuple[int, int]]]:
+    """
+    Map per-row range lists from native to SR coordinates and merge overlaps.
+    
+    Input: list of per-row range lists [[(s,e), ...], ...]
+    """
+    if factor < 1:
+        raise ValueError("factor must be >= 1")
+
+    def merge(rs):
+        out: List[Tuple[int, int]] = []
+        for s, e in rs:
+            if not out or s > out[-1][1] + 1:
+                out.append((s, e))
+            else:
+                out[-1] = (out[-1][0], max(out[-1][1], e))
+        return out
+
+    new: List[List[Tuple[int, int]]] = []
+    for sub in ranges_list:
+        adjusted = [(s // factor, e // factor) for s, e in sub]
+        adjusted = sorted(set(adjusted))
+        merged = merge(adjusted)
+        new.append(merged)
+    return new
+
+
+# ===========================================================================
+# 5. Kernel primitives (Numba JIT)
+# ===========================================================================
+
+@njit(cache=True, fastmath=True)
+def _truncated_kernel_vector(w: float, r: int, kind_is_gaussian: bool) -> np.ndarray:
+    """Build k[d] for d = 0..r.  Gaussian: exp(-(d²)/(w²));  Laplace: exp(-d/w)."""
+    d = np.arange(r + 1, dtype=np.float64)
+    if kind_is_gaussian:
+        return np.exp(-(d * d) / (w * w))
+    else:
+        sigma = w if w > 1e-12 else 1e-12
+        return np.exp(-d / sigma)
+
+
+# ===========================================================================
+# 6. NWKR SRA computation (Numba JIT)
+# ===========================================================================
+
+@njit(cache=True, fastmath=True)
+def _calculate_sra_trunc(array: np.ndarray, k: np.ndarray):
+    """
+    Truncated-kernel NWKR SRA (global SSE baseline).
+    Returns (sra, pred_array, numer_all, denom_all).
+    Works for both Gaussian and Laplace since k already encodes the kernel shape.
+    """
+    n = array.shape[0]
+    r = k.shape[0] - 1
+    eps = 1e-12
+
+    numer = np.empty(n, dtype=np.float64)
+    denom = np.empty(n, dtype=np.float64)
+    pred = np.empty(n, dtype=np.float64)
+
+    for i in range(n):
+        j0 = max(0, i - r)
+        j1 = min(n - 1, i + r)
+        num = 0.0
+        den = 0.0
+        for j in range(j0, j1 + 1):
+            d = i - j
+            if d < 0:
+                d = -d
+            wgt = k[d]
+            den += wgt
+            num += wgt * array[j]
+        numer[i] = num
+        denom[i] = den
+        pi = num / (den if den > eps else eps)
+        pred[i] = pi
+
+    sra = 0.0
+    for i in range(n):
+        di = array[i] - pred[i]
+        sra += di * di
+
+    return sra, pred, numer, denom
+
+
+# ===========================================================================
+# 7. Incremental state management (Numba JIT)
+#    Direct port of helpers/kernel_optimized_state.py
+# ===========================================================================
+
+@njit(cache=True, fastmath=True)
+def _is_inside(buf_idxs: np.ndarray, m: int, idx: int) -> bool:
+    lo = 0
+    hi = m
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if buf_idxs[mid] < idx:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo < m and buf_idxs[lo] == idx
+
+
+@njit(cache=True, fastmath=True)
+def _nin_din_init_full(
+    x: np.ndarray, idxs_in: np.ndarray, k: np.ndarray,
+    nin: np.ndarray, din: np.ndarray,
+) -> None:
+    n = x.shape[0]
+    r = k.shape[0] - 1
+    for i in range(n):
+        nin[i] = 0.0
+        din[i] = 0.0
+    for p in range(idxs_in.shape[0]):
+        j = int(idxs_in[p])
+        xj = x[j]
+        i = j
+        while i >= 0:
+            d = j - i
+            if d > r:
+                break
+            nin[i] += k[d] * xj
+            din[i] += k[d]
+            i -= 1
+        i = j + 1
+        while i < n:
+            d = i - j
+            if d > r:
+                break
+            nin[i] += k[d] * xj
+            din[i] += k[d]
+            i += 1
+
+
+@njit(cache=True, fastmath=True)
+def _nin_din_add(x: np.ndarray, nin: np.ndarray, din: np.ndarray,
+                 idx: int, k: np.ndarray) -> None:
+    r = k.shape[0] - 1
+    n = nin.shape[0]
+    xj = x[idx]
+    i = idx
+    while i >= 0:
+        d = idx - i
+        if d > r:
+            break
+        nin[i] += k[d] * xj
+        din[i] += k[d]
+        i -= 1
+    i = idx + 1
+    while i < n:
+        d = i - idx
+        if d > r:
+            break
+        nin[i] += k[d] * xj
+        din[i] += k[d]
+        i += 1
+
+
+@njit(cache=True, fastmath=True)
+def _nin_din_remove(x: np.ndarray, nin: np.ndarray, din: np.ndarray,
+                    idx: int, k: np.ndarray) -> None:
+    r = k.shape[0] - 1
+    n = nin.shape[0]
+    xj = x[idx]
+    i = idx
+    while i >= 0:
+        d = idx - i
+        if d > r:
+            break
+        nin[i] -= k[d] * xj
+        din[i] -= k[d]
+        i -= 1
+    i = idx + 1
+    while i < n:
+        d = i - idx
+        if d > r:
+            break
+        nin[i] -= k[d] * xj
+        din[i] -= k[d]
+        i += 1
+
+
+@njit(cache=True, fastmath=True)
+def _sse_out_from_nin_din(
+    x: np.ndarray, numer_all: np.ndarray, denom_all: np.ndarray,
+    nin: np.ndarray, din: np.ndarray,
+    buf_idxs: np.ndarray, m: int,
+) -> float:
+    n = x.shape[0]
+    eps = 1e-12
+    sse = 0.0
+    p = 0
+    for i in range(n):
+        while p < m and buf_idxs[p] < i:
+            p += 1
+        if p < m and buf_idxs[p] == i:
+            continue
+        den_out = denom_all[i] - din[i]
+        num_out = numer_all[i] - nin[i]
+        pred = num_out / den_out if den_out > eps else 0.0
+        sse += (x[i] - pred) ** 2
+    return sse
+
+
+@njit(cache=True, fastmath=True)
+def _sse_out_add(
+    x: np.ndarray, numer_all: np.ndarray, denom_all: np.ndarray,
+    nin: np.ndarray, din: np.ndarray,
+    buf_idxs: np.ndarray, m_new: int,
+    new_idx: int, k: np.ndarray, sse_out: float,
+) -> float:
+    r = k.shape[0] - 1
+    eps = 1e-12
+    n = nin.shape[0]
+    x_new = x[new_idx]
+
+    nin_old = nin[new_idx] - k[0] * x_new
+    din_old = din[new_idx] - k[0]
+    den_out_old = denom_all[new_idx] - din_old
+    num_out_old = numer_all[new_idx] - nin_old
+    pred_old = num_out_old / den_out_old if den_out_old > eps else 0.0
+    sse_out -= (x_new - pred_old) ** 2
+
+    i = new_idx - 1
+    while i >= 0:
+        d = new_idx - i
+        if d > r:
+            break
+        if not _is_inside(buf_idxs, m_new, i):
+            w = k[d]
+            nin_old_i = nin[i] - w * x_new
+            din_old_i = din[i] - w
+            den_out_old = denom_all[i] - din_old_i
+            num_out_old = numer_all[i] - nin_old_i
+            pred_old_i = num_out_old / den_out_old if den_out_old > eps else 0.0
+            den_out_new = denom_all[i] - din[i]
+            num_out_new = numer_all[i] - nin[i]
+            pred_new_i = num_out_new / den_out_new if den_out_new > eps else 0.0
+            sse_out -= (x[i] - pred_old_i) ** 2
+            sse_out += (x[i] - pred_new_i) ** 2
+        i -= 1
+
+    i = new_idx + 1
+    while i < n:
+        d = i - new_idx
+        if d > r:
+            break
+        if not _is_inside(buf_idxs, m_new, i):
+            w = k[d]
+            nin_old_i = nin[i] - w * x_new
+            din_old_i = din[i] - w
+            den_out_old = denom_all[i] - din_old_i
+            num_out_old = numer_all[i] - nin_old_i
+            pred_old_i = num_out_old / den_out_old if den_out_old > eps else 0.0
+            den_out_new = denom_all[i] - din[i]
+            num_out_new = numer_all[i] - nin[i]
+            pred_new_i = num_out_new / den_out_new if den_out_new > eps else 0.0
+            sse_out -= (x[i] - pred_old_i) ** 2
+            sse_out += (x[i] - pred_new_i) ** 2
+        i += 1
+
+    return sse_out
+
+
+@njit(cache=True, fastmath=True)
+def _sse_out_remove(
+    x: np.ndarray, numer_all: np.ndarray, denom_all: np.ndarray,
+    nin: np.ndarray, din: np.ndarray,
+    buf_idxs: np.ndarray, m_new: int,
+    rem_idx: int, k: np.ndarray, sse_out: float,
+) -> float:
+    r = k.shape[0] - 1
+    eps = 1e-12
+    n = nin.shape[0]
+    x_rem = x[rem_idx]
+
+    den_out_new = denom_all[rem_idx] - din[rem_idx]
+    num_out_new = numer_all[rem_idx] - nin[rem_idx]
+    pred_new = num_out_new / den_out_new if den_out_new > eps else 0.0
+    sse_out += (x_rem - pred_new) ** 2
+
+    i = rem_idx - 1
+    while i >= 0:
+        d = rem_idx - i
+        if d > r:
+            break
+        if not _is_inside(buf_idxs, m_new, i):
+            w = k[d]
+            nin_old_i = nin[i] + w * x_rem
+            din_old_i = din[i] + w
+            den_out_old = denom_all[i] - din_old_i
+            num_out_old = numer_all[i] - nin_old_i
+            pred_old_i = num_out_old / den_out_old if den_out_old > eps else 0.0
+            den_out_new = denom_all[i] - din[i]
+            num_out_new = numer_all[i] - nin[i]
+            pred_new_i = num_out_new / den_out_new if den_out_new > eps else 0.0
+            sse_out -= (x[i] - pred_old_i) ** 2
+            sse_out += (x[i] - pred_new_i) ** 2
+        i -= 1
+
+    i = rem_idx + 1
+    while i < n:
+        d = i - rem_idx
+        if d > r:
+            break
+        if not _is_inside(buf_idxs, m_new, i):
+            w = k[d]
+            nin_old_i = nin[i] + w * x_rem
+            din_old_i = din[i] + w
+            den_out_old = denom_all[i] - din_old_i
+            num_out_old = numer_all[i] - nin_old_i
+            pred_old_i = num_out_old / den_out_old if den_out_old > eps else 0.0
+            den_out_new = denom_all[i] - din[i]
+            num_out_new = numer_all[i] - nin[i]
+            pred_new_i = num_out_new / den_out_new if den_out_new > eps else 0.0
+            sse_out -= (x[i] - pred_old_i) ** 2
+            sse_out += (x[i] - pred_new_i) ** 2
+        i += 1
+
+    return sse_out
+
+
+# ---- buf: sorted buffer of inside indices + local NWKR stats ----
+
+@njit(cache=True, fastmath=True)
+def _buf_init(
+    x: np.ndarray, idxs_in: np.ndarray, k: np.ndarray,
+    buf_idxs: np.ndarray, buf_num: np.ndarray, buf_den: np.ndarray,
+) -> Tuple[int, float]:
+    m0 = idxs_in.shape[0]
+    r = k.shape[0] - 1
+    eps = 1e-12
+    for t in range(m0):
+        buf_idxs[t] = idxs_in[t]
+    for u in range(m0):
+        i = int(buf_idxs[u])
+        s_num = 0.0
+        s_den = 0.0
+        v = u
+        while v >= 0:
+            d = i - int(buf_idxs[v])
+            if d > r:
+                break
+            s_num += k[d] * x[int(buf_idxs[v])]
+            s_den += k[d]
+            v -= 1
+        v = u + 1
+        while v < m0:
+            d = int(buf_idxs[v]) - i
+            if d > r:
+                break
+            s_num += k[d] * x[int(buf_idxs[v])]
+            s_den += k[d]
+            v += 1
+        buf_num[u] = s_num
+        buf_den[u] = s_den
+    sse_in = 0.0
+    for u in range(m0):
+        d = buf_den[u]
+        pred = buf_num[u] / d if d > eps else 0.0
+        sse_in += (x[int(buf_idxs[u])] - pred) ** 2
+    return m0, float(sse_in)
+
+
+@njit(cache=True, fastmath=True)
+def _buf_add(
+    x: np.ndarray, new_idx: int, k: np.ndarray,
+    buf_idxs: np.ndarray, buf_num: np.ndarray, buf_den: np.ndarray,
+    m: int, sse_in: float,
+) -> Tuple[int, float]:
+    r = k.shape[0] - 1
+    eps = 1e-12
+    x_new = x[new_idx]
+    lo = 0
+    hi = m
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if buf_idxs[mid] < new_idx:
+            lo = mid + 1
+        else:
+            hi = mid
+    ins = lo
+    for t in range(m - 1, ins - 1, -1):
+        buf_idxs[t + 1] = buf_idxs[t]
+        buf_num[t + 1] = buf_num[t]
+        buf_den[t + 1] = buf_den[t]
+    buf_idxs[ins] = new_idx
+    m_new = m + 1
+
+    v = ins - 1
+    while v >= 0:
+        d = new_idx - int(buf_idxs[v])
+        if d > r:
+            break
+        w = k[d]
+        od = buf_den[v]
+        op = buf_num[v] / od if od > eps else 0.0
+        sse_in -= (x[int(buf_idxs[v])] - op) ** 2
+        buf_num[v] += w * x_new
+        buf_den[v] += w
+        nd = buf_den[v]
+        np_ = buf_num[v] / nd if nd > eps else 0.0
+        sse_in += (x[int(buf_idxs[v])] - np_) ** 2
+        v -= 1
+    v = ins + 1
+    while v < m_new:
+        d = int(buf_idxs[v]) - new_idx
+        if d > r:
+            break
+        w = k[d]
+        od = buf_den[v]
+        op = buf_num[v] / od if od > eps else 0.0
+        sse_in -= (x[int(buf_idxs[v])] - op) ** 2
+        buf_num[v] += w * x_new
+        buf_den[v] += w
+        nd = buf_den[v]
+        np_ = buf_num[v] / nd if nd > eps else 0.0
+        sse_in += (x[int(buf_idxs[v])] - np_) ** 2
+        v += 1
+
+    s_num = k[0] * x_new
+    s_den = k[0]
+    v = ins - 1
+    while v >= 0:
+        d = new_idx - int(buf_idxs[v])
+        if d > r:
+            break
+        s_num += k[d] * x[int(buf_idxs[v])]
+        s_den += k[d]
+        v -= 1
+    v = ins + 1
+    while v < m_new:
+        d = int(buf_idxs[v]) - new_idx
+        if d > r:
+            break
+        s_num += k[d] * x[int(buf_idxs[v])]
+        s_den += k[d]
+        v += 1
+    buf_num[ins] = s_num
+    buf_den[ins] = s_den
+    pred_new = s_num / s_den if s_den > eps else 0.0
+    sse_in += (x_new - pred_new) ** 2
+    return m_new, float(sse_in)
+
+
+@njit(cache=True, fastmath=True)
+def _buf_remove(
+    x: np.ndarray, rem_idx: int, k: np.ndarray,
+    buf_idxs: np.ndarray, buf_num: np.ndarray, buf_den: np.ndarray,
+    m: int, sse_in: float,
+) -> Tuple[int, float]:
+    r = k.shape[0] - 1
+    eps = 1e-12
+    x_rem = x[rem_idx]
+    lo = 0
+    hi = m
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if buf_idxs[mid] < rem_idx:
+            lo = mid + 1
+        else:
+            hi = mid
+    pos = lo
+    if pos >= m or buf_idxs[pos] != rem_idx:
+        return m, sse_in
+
+    od = buf_den[pos]
+    op = buf_num[pos] / od if od > eps else 0.0
+    sse_in -= (x_rem - op) ** 2
+
+    v = pos - 1
+    while v >= 0:
+        d = rem_idx - int(buf_idxs[v])
+        if d > r:
+            break
+        w = k[d]
+        od = buf_den[v]
+        op = buf_num[v] / od if od > eps else 0.0
+        sse_in -= (x[int(buf_idxs[v])] - op) ** 2
+        buf_num[v] -= w * x_rem
+        buf_den[v] -= w
+        nd = buf_den[v]
+        np_ = buf_num[v] / nd if nd > eps else 0.0
+        sse_in += (x[int(buf_idxs[v])] - np_) ** 2
+        v -= 1
+    v = pos + 1
+    while v < m:
+        d = int(buf_idxs[v]) - rem_idx
+        if d > r:
+            break
+        w = k[d]
+        od = buf_den[v]
+        op = buf_num[v] / od if od > eps else 0.0
+        sse_in -= (x[int(buf_idxs[v])] - op) ** 2
+        buf_num[v] -= w * x_rem
+        buf_den[v] -= w
+        nd = buf_den[v]
+        np_ = buf_num[v] / nd if nd > eps else 0.0
+        sse_in += (x[int(buf_idxs[v])] - np_) ** 2
+        v += 1
+
+    for t in range(pos, m - 1):
+        buf_idxs[t] = buf_idxs[t + 1]
+        buf_num[t] = buf_num[t + 1]
+        buf_den[t] = buf_den[t + 1]
+    return m - 1, float(sse_in)
+
+
+# ---- Truncated-kernel prediction on a subset ----
+
+@njit(cache=True, fastmath=True)
+def _predict_on_idxs_trunc(array: np.ndarray, idxs: np.ndarray,
+                            k: np.ndarray) -> np.ndarray:
+    m = idxs.shape[0]
+    r = k.shape[0] - 1
+    out = np.empty(m, dtype=np.float64)
+    for ii in range(m):
+        i0 = idxs[ii]
+        num = 0.0
+        den = 0.0
+        jj = ii
+        while jj >= 0:
+            d = i0 - idxs[jj]
+            if d > r:
+                break
+            w = k[d]
+            num += w * array[idxs[jj]]
+            den += w
+            jj -= 1
+        jj = ii + 1
+        while jj < m:
+            d = idxs[jj] - i0
+            if d > r:
+                break
+            w = k[d]
+            num += w * array[idxs[jj]]
+            den += w
+            jj += 1
+        out[ii] = num / den if den > 1e-12 else 0.0
+    return out
+
+
+# ===========================================================================
+# 8. Core scan functions (use incremental state)
+#    These operate on data at whatever resolution they are given.
+# ===========================================================================
+
+def _derive_params(frequency: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    Derive kernel/window params from frequency grid.
+    Returns (w, kernel_cap, range_cap, window_bins).
+    """
+    L = len(frequency)
+    freq_step = abs(float(frequency[1] - frequency[0]))
+    if freq_step <= 0.0:
+        freq_step = _REF_FREQ
+    R = _REF_FREQ / freq_step
+    w = int(round(max(3.0, min(R, L / 16.0))))
+    kernel_cap = 2 * w
+    range_cap = 3 * w
+    window_bins = int(math.floor(R)) + 1
+    return w, kernel_cap, range_cap, window_bins
+
+
+def _overlap_fraction(a: int, b: int, ranges: List[Tuple[int, int]]) -> float:
+    if b < a or not ranges:
+        return 0.
+    wl = b - a + 1
+    ov = 0
+    for s, e in ranges:
+        lo = max(a, s)
+        hi = min(b, e)
+        if hi >= lo:
+            ov += hi - lo + 1
+    return ov / wl
+
+
+def _scan_row(
+    row: np.ndarray,
+    ignore_ranges: List[Tuple[int, int]],
+    flag_ranges: List[Tuple[int, int]],
+    frequency: np.ndarray,
+    buffer: int,
+    sr_factor_val: int,
+    kernel_kind: str,
+) -> Tuple:
+    """
+    Run scan on one row at its current resolution.
+
+    Returns a tuple:
+        (row_idx, wm, sm, pred_array, im, vm, w*sr_factor, range_cap*sr_factor,
+         wu, su, ovl_u, iu, vu, wf, sf, ovl_f, if_, vf, window_bins*sr_factor)
+    """
+    is_gaussian = kernel_kind.lower() == "gaussian"
+    n = row.shape[0]
+    _bad_win = (0, -1)
+    _bad = (0., _bad_win, 0., np.array([]), None, None, 0, 0,
+            _bad_win, 0., 0., None, None, _bad_win, 0., 0., None, None, 0)
+
+    if len(frequency) < 2 or not np.isfinite(frequency[:2]).all():
+        return _bad
+
+    w, kernel_cap, range_cap, window_bins = _derive_params(frequency)
+    k_vector = _truncated_kernel_vector(float(w), kernel_cap, is_gaussian)
+
+    row_trimmed = row[buffer:n - buffer]
+    n_trimmed = row_trimmed.shape[0]
+    if n_trimmed <= 0:
+        return _bad
+
+    # SRA on trimmed (for varlen) and full (for fixed)
+    sra, pred_array, numer_all, denom_all = _calculate_sra_trunc(
+        row_trimmed.astype(np.float64), k_vector)
+    sra_full, _, numer_all_full, denom_all_full = _calculate_sra_trunc(
+        row.astype(np.float64), k_vector)
+    sra = max(sra, 1e-12)
+    sra_full = max(sra_full, 1e-12)
+
+    # Build masked valid set
+    ignore_trimmed: List[Tuple[int, int]] = []
+    for s, e in ignore_ranges:
+        s0 = max(s - buffer, 0)
+        e0 = min(e - buffer, n_trimmed - 1)
+        if s0 <= e0:
+            ignore_trimmed.append((s0, e0))
+    for s, e in flag_ranges:
+        s0 = max(s - buffer, 0)
+        e0 = min(e - buffer, n_trimmed - 1)
+        if s0 <= e0:
+            ignore_trimmed.append((s0, e0))
+
+    mask = np.ones(n_trimmed, dtype=np.bool_)
+    for s0, e0 in ignore_trimmed:
+        mask[s0:e0 + 1] = False
+    all_trimmed = np.arange(n_trimmed, dtype=np.int64)
+    valid_idxs_masked = np.nonzero(mask)[0]
+
+    REFRESH = max(1, range_cap)
+
+    # ------------------------------------------------------------------
+    # _varlen_search — incremental O(r) per inner step
+    # ------------------------------------------------------------------
+    def _varlen_search(valid: np.ndarray):
+        best_sc = 0.0
+        best_win = (0, -1)
+        best_idx_full = None
+        best_vals = None
+
+        if len(valid) < 2:
+            return best_win, best_sc, best_idx_full, best_vals
+
+        n_valid = valid.shape[0]
+        cap = range_cap + 2
+        buf_idxs = np.empty(cap, dtype=np.int64)
+        buf_num = np.empty(cap, dtype=np.float64)
+        buf_den = np.empty(cap, dtype=np.float64)
+        nin = np.zeros(n_trimmed, dtype=np.float64)
+        din = np.zeros(n_trimmed, dtype=np.float64)
+
+        carry_valid = False
+        carry_left_idx = -1
+        steps_since_refresh = 0
+
+        for pos_i in range(n_valid):
+            i = int(valid[pos_i])
+
+            if pos_i + 1 < n_valid and valid[pos_i + 1] != i + 1:
+                carry_valid = False
+                continue
+
+            use_carry = carry_valid and carry_left_idx == i - 1
+
+            if use_carry:
+                _nin_din_remove(row_trimmed, nin, din, i - 1, k_vector)
+            else:
+                for ii in range(n_trimmed):
+                    nin[ii] = 0.0
+                    din[ii] = 0.0
+                steps_since_refresh = 0
+
+            g_in_initialized = False
+            m = 0
+            sse_in = 0.0
+            sse_out = 0.0
+
+            max_k = min(pos_i + range_cap, n_valid - 1)
+
+            for kk in range(pos_i + 1, max_k + 1):
+                if valid[kk] != valid[kk - 1] + 1:
+                    break
+                j = int(valid[kk])
+
+                if not g_in_initialized:
+                    _nin_din_init_full(
+                        row_trimmed,
+                        np.array([i, j], dtype=np.int64),
+                        k_vector, nin, din)
+                    m, sse_in = _buf_init(
+                        row_trimmed,
+                        np.array([i, j], dtype=np.int64),
+                        k_vector, buf_idxs, buf_num, buf_den)
+                    sse_out = _sse_out_from_nin_din(
+                        row_trimmed, numer_all, denom_all, nin, din, buf_idxs, m)
+                    steps_since_refresh = 0
+                    g_in_initialized = True
+                else:
+                    _nin_din_add(row_trimmed, nin, din, j, k_vector)
+                    m, sse_in = _buf_add(
+                        row_trimmed, j, k_vector, buf_idxs, buf_num, buf_den, m, sse_in)
+                    sse_out = _sse_out_add(
+                        row_trimmed, numer_all, denom_all, nin, din,
+                        buf_idxs, m, j, k_vector, sse_out)
+                    steps_since_refresh += 1
+                    if steps_since_refresh >= REFRESH:
+                        sse_out = _sse_out_from_nin_din(
+                            row_trimmed, numer_all, denom_all, nin, din, buf_idxs, m)
+                        steps_since_refresh = 0
+
+                sc = 1.0 - (sse_in + sse_out) / sra
+                if sc > best_sc:
+                    best_sc = sc
+                    best_win = (i, j)
+                    best_idx_full = buf_idxs[:m].copy() + buffer
+                    best_vals = _predict_on_idxs_trunc(
+                        row_trimmed, buf_idxs[:m].copy(), k_vector)
+
+            if g_in_initialized:
+                carry_valid = True
+                carry_left_idx = int(i)
+            else:
+                carry_valid = False
+
+        oi, oj = best_win
+        return (oi + buffer, oj + buffer), best_sc, best_idx_full, best_vals
+
+    # ------------------------------------------------------------------
+    # _fixedlen_sweep — O(n*r) total
+    # ------------------------------------------------------------------
+    def _fixedlen_sweep():
+        best_sc = 0.0
+        best_win = (0, -1)
+        best_idx_full = None
+        best_vals = None
+
+        if window_bins <= 0 or window_bins > n:
+            return best_win, best_sc, best_idx_full, best_vals
+
+        cap = window_bins + 1
+        buf_idxs_f = np.empty(cap, dtype=np.int64)
+        buf_num_f = np.empty(cap, dtype=np.float64)
+        buf_den_f = np.empty(cap, dtype=np.float64)
+        nin_f = np.zeros(n, dtype=np.float64)
+        din_f = np.zeros(n, dtype=np.float64)
+
+        m = 0
+        sse_in = 0.0
+        sse_out = 0.0
+        g_in_initialized = False
+        steps = 0
+
+        for i in range(n - window_bins + 1):
+            j = i + window_bins - 1
+            inside = np.arange(i, i + window_bins, dtype=np.int64)
+
+            if not g_in_initialized:
+                _nin_din_init_full(row, inside, k_vector, nin_f, din_f)
+                m, sse_in = _buf_init(row, inside, k_vector,
+                                      buf_idxs_f, buf_num_f, buf_den_f)
+                sse_out = _sse_out_from_nin_din(
+                    row, numer_all_full, denom_all_full, nin_f, din_f,
+                    buf_idxs_f, m)
+                steps = 0
+                g_in_initialized = True
+            else:
+                rem = np.int64(i - 1)
+                add = np.int64(j)
+                _nin_din_remove(row, nin_f, din_f, rem, k_vector)
+                m, sse_in = _buf_remove(row, rem, k_vector,
+                                        buf_idxs_f, buf_num_f, buf_den_f, m, sse_in)
+                sse_out = _sse_out_remove(
+                    row, numer_all_full, denom_all_full, nin_f, din_f,
+                    buf_idxs_f, m, rem, k_vector, sse_out)
+                _nin_din_add(row, nin_f, din_f, add, k_vector)
+                m, sse_in = _buf_add(row, add, k_vector,
+                                     buf_idxs_f, buf_num_f, buf_den_f, m, sse_in)
+                sse_out = _sse_out_add(
+                    row, numer_all_full, denom_all_full, nin_f, din_f,
+                    buf_idxs_f, m, add, k_vector, sse_out)
+                steps += 1
+                if steps >= REFRESH:
+                    sse_out = _sse_out_from_nin_din(
+                        row, numer_all_full, denom_all_full, nin_f, din_f,
+                        buf_idxs_f, m)
+                    steps = 0
+
+            sc = 1.0 - (sse_in + sse_out) / sra_full
+            if sc > best_sc:
+                best_sc = sc
+                best_win = (i, j)
+                best_idx_full = inside.copy()
+                best_vals = _predict_on_idxs_trunc(row, inside, k_vector)
+
+        return best_win, best_sc, best_idx_full, best_vals
+
+    wm, sm, im, vm = _varlen_search(valid_idxs_masked)
+    wu, su, iu, vu = _varlen_search(all_trimmed)
+    ovl_u = _overlap_fraction(wu[0], wu[1], ignore_ranges)
+    wf, sf, if_, vf = _fixedlen_sweep()
+    ovl_f = _overlap_fraction(wf[0], wf[1], ignore_ranges)
+
+    return (0, wm, sm, pred_array, im, vm,
+            w * sr_factor_val, range_cap * sr_factor_val,
+            wu, su, ovl_u, iu, vu,
+            wf, sf, ovl_f, if_, vf,
+            window_bins * sr_factor_val)
+
+
+# ===========================================================================
+# 9. Superresolution refinement
+# ===========================================================================
+
+def _refine_all_windows(
+    spec_native: np.ndarray,
+    freq_native: np.ndarray,
+    win_masked_sr: Tuple[int, int],
+    win_unmasked_sr: Tuple[int, int],
+    win_fixed_sr: Tuple[int, int],
+    atm_ranges: List[Tuple[int, int]],
+    w_native: int,
+    range_cap_native: int,
+    sr: int,
+    buffer: int,
+    kernel_kind: str,
+) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+    """
+    Refine SR-resolution windows back to native resolution.
+
+    Uses w_native and range_cap_native (= w*SR, range_cap*SR from the scan)
+    as the kernel parameters for refinement
+    which uses range_cap as the kernel truncation radius r.
+    """
+    is_gaussian = kernel_kind.lower() == "gaussian"
+    L = len(spec_native)
+    n_trimmed = L - 2 * buffer
+
+    if n_trimmed <= 0:
+        return (0, 0), (0, 0), (0, 0)
+
+    row_trimmed = np.asarray(spec_native[buffer:L - buffer], dtype=np.float64)
+
+    k_vector = _truncated_kernel_vector(float(w_native), range_cap_native, is_gaussian)
+    sra, _, _, _ = _calculate_sra_trunc(row_trimmed, k_vector)
+    sra = max(float(sra), 1e-12)
+
+    # Build valid sets
+    mask = np.ones(n_trimmed, dtype=np.bool_)
+    for s, e in atm_ranges:
+        s0 = max(s - buffer, 0)
+        e0 = min(e - buffer, n_trimmed - 1)
+        if s0 <= e0:
+            mask[s0:e0 + 1] = False
+    valid_all = np.arange(n_trimmed, dtype=np.int64)
+    valid_masked = valid_all[mask]
+
+    def _subset_sse(idxs: np.ndarray) -> float:
+        if idxs.size == 0:
+            return 0.0
+        preds = _predict_on_idxs_trunc(row_trimmed, idxs, k_vector)
+        diff = row_trimmed[idxs] - preds
+        return float(np.dot(diff, diff))
+
+    def _score_varlen(a: int, b: int, valid: np.ndarray) -> float:
+        if b < a:
+            return 0
+        inside = valid[(valid >= a) & (valid <= b)]
+        if inside.size == 0:
+            return 0
+        outside = np.setdiff1d(valid_all, inside, assume_unique=False)
+        sri = _subset_sse(inside)
+        sro = _subset_sse(outside)
+        return 1.0 - (sri + sro) / sra
+
+    def _refine_varlen_from_sr(x_sr: int, y_sr: int, valid: np.ndarray) -> Tuple[int, int]:
+        a_lo = max(x_sr * sr - buffer, 0)
+        a_hi = min((x_sr + 1) * sr - 1 - buffer, n_trimmed - 1)
+        b_lo = max(y_sr * sr - buffer, 0)
+        b_hi = min((y_sr + 1) * sr - 1 - buffer, n_trimmed - 1)
+
+        best_sc = 0
+        best_ab = (a_lo, max(a_lo, b_lo))
+
+        for a in range(a_lo, a_hi + 1):
+            b_start = max(a, b_lo)
+            for b in range(b_start, b_hi + 1):
+                sc = _score_varlen(a, b, valid)
+                if sc > best_sc:
+                    best_sc = sc
+                    best_ab = (a, b)
+
+        a_t, b_t = best_ab
+        return (a_t + buffer, b_t + buffer)
+
+    def _refine_fixed_from_sr(x_sr: int, y_sr: int) -> Tuple[int, int]:
+        freq_step = abs(float(freq_native[1] - freq_native[0]))
+        R = _REF_FREQ / (freq_step if freq_step > 0 else 1.0)
+        fixed_bins_native = int(math.floor(R)) + 1
+        fixed_bins_native = max(1, min(fixed_bins_native, n_trimmed))
+
+        a_lo = max(x_sr * sr - buffer, 0)
+        a_hi = min((x_sr + 1) * sr - 1 - buffer, n_trimmed - fixed_bins_native)
+
+        best_sc = 0
+        best_a = a_lo
+
+        for a in range(a_lo, a_hi + 1):
+            b = a + fixed_bins_native - 1
+            sc = _score_varlen(a, b, valid_all)
+            if sc > best_sc:
+                best_sc = sc
+                best_a = a
+
+        b_t = best_a + fixed_bins_native - 1
+        return (best_a + buffer, b_t + buffer)
+
+    xm, ym = win_masked_sr
+    xu, yu = win_unmasked_sr
+    xf, yf = win_fixed_sr
+
+    out_masked = _refine_varlen_from_sr(xm, ym, valid_masked)
+    out_unmasked = _refine_varlen_from_sr(xu, yu, valid_all)
+    out_fixed = _refine_fixed_from_sr(xf, yf)
+
+    return out_masked, out_unmasked, out_fixed
+
+
+# ===========================================================================
+# 10. Helpers
+# ===========================================================================
 
 def _flag_array_to_ranges(flag_array: np.ndarray) -> List[Tuple[int, int]]:
-    """Convert a boolean flag array to a list of inclusive (start, end) ranges."""
     ranges: List[Tuple[int, int]] = []
     idx = 0
     for val, grp in groupby(flag_array.tolist()):
@@ -131,250 +1104,112 @@ def _flag_array_to_ranges(flag_array: np.ndarray) -> List[Tuple[int, int]]:
         idx += length
     return ranges
 
-# ---------------------------------------------------------------------------
-# Helpers: truncated kernel vector (mirrors cosmicai.kernels)
-# ---------------------------------------------------------------------------
 
-def _truncated_kernel_vector(w: float, r: int, kind: str = "gaussian") -> np.ndarray:
-    """
-    Build k[d] for d = 0..r.
-
-    Gaussian : exp(-(d^2)/(w^2))
-    Laplace  : exp(-d/w)
-    """
-    d = np.arange(r + 1, dtype=np.float64)
-    if kind == "gaussian":
-        return np.exp(-(d * d) / (w * w))
-    if kind == "laplace":
-        return np.exp(-d / max(float(w), 1e-12))
-    raise ValueError(f"Unknown kernel kind: {kind!r}")
-
-# ---------------------------------------------------------------------------
-# Helpers: NWKR SSE with a truncated kernel (pure NumPy, no Numba)
-# ---------------------------------------------------------------------------
-
-def _nwkr_sse_trunc(x: np.ndarray, idxs: np.ndarray, k_vec: np.ndarray) -> float:
-    """
-    NWKR sum-of-squared residuals over the subset ``idxs``.
-
-    For each index i in ``idxs`` the prediction is::
-
-        yhat[i] = sum_{j in idxs, |i-j|<=r}  k[|i-j|] * x[j]
-                / sum_{j in idxs, |i-j|<=r}  k[|i-j|]
-
-    ``idxs`` must be sorted ascending (as produced by np.arange or np.nonzero).
-    """
-    m = idxs.shape[0]
-    if m == 0:
-        return 0.0
-
-    r = k_vec.shape[0] - 1
-    sse = 0.0
-
-    for ui in range(m):
-        i = int(idxs[ui])
-        s_num = 0.0
-        s_den = 0.0
-
-        # scan left neighbours
-        vi = ui
-        while vi >= 0:
-            dist = i - int(idxs[vi])
-            if dist > r:
-                break
-            w = k_vec[dist]
-            s_num += w * x[int(idxs[vi])]
-            s_den += w
-            vi -= 1
-
-        # scan right neighbours
-        vi = ui + 1
-        while vi < m:
-            dist = int(idxs[vi]) - i
-            if dist > r:
-                break
-            w = k_vec[dist]
-            s_num += w * x[int(idxs[vi])]
-            s_den += w
-            vi += 1
-
-        pred = s_num / s_den if s_den > 1e-12 else 0.0
-        diff = x[i] - pred
-        sse += diff * diff
-
-    return float(sse)
-
-
-def _nwkr_sra(x: np.ndarray, k_vec: np.ndarray) -> float:
-    """Global NWKR SSE (SRA baseline) over the full array x."""
-    return max(_nwkr_sse_trunc(x, np.arange(x.shape[0], dtype=np.int64), k_vec), 1e-12)
-
-# ---------------------------------------------------------------------------
-# Core per-row scan
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 11. Full single-row pipeline (with superresolution)
+# ===========================================================================
 
 def _scan_single_row(
     amplitude: np.ndarray,
     frequency: np.ndarray,
+    atm_ranges: List[Tuple[int, int]],
     flag_ranges: List[Tuple[int, int]],
     buffer: int,
     kernel_kind: str,
 ) -> ScanResult:
     """
-    Run all three scan modes on one spectrum.
-
-    Parameters
-    ----------
-    amplitude    : 1-D float64 spectrum values.
-    frequency    : 1-D float64 frequency axis (GHz).
-    flag_ranges  : Inclusive (start, end) index pairs for flagged regions.
-    buffer       : Number of edge channels to exclude from varlen scans.
-    kernel_kind  : "gaussian" or "laplace".
-
-    Returns
-    -------
-    ScanResult
-        ``{"masked": Output, "unmasked": Output, "fixed": Output}``
+    Run all three scan modes:
+    1. Compute SR factor from spectrum length
+    2. Superresolve data, ranges, frequencies BEFORE scanning
+    3. Scan at SR resolution → get scores and SR-coordinate windows
+    4. If SR > 1, refine windows to native resolution
+    5. Return scores from SR scan + refined windows
     """
-    x = amplitude
-    n = x.shape[0]
-    _BAD = Output(score=-np.inf, win_start=0, win_end=0)
+    _BAD = Output(score=0., win_start=0, win_end=0, overlap_pct=0.0)
+    _BAD_RESULT: ScanResult = {"masked": _BAD, "unmasked": _BAD, "fixed": _BAD}
 
+    n = amplitude.shape[0]
     if n < 4 or len(frequency) < 2:
-        return {"masked": _BAD, "unmasked": _BAD, "fixed": _BAD}
+        return _BAD_RESULT
 
-    # ---- derive kernel/window parameters from frequency grid ----
-    freq_step = abs(float(frequency[1] - frequency[0]))
-    if freq_step <= 0.0:
-        freq_step = _REF_FREQ
-    R = _REF_FREQ / freq_step
-    L = len(frequency)
+    SR = _sr_factor(n)
 
-    w = int(round(max(3.0, min(R, L / 16.0))))   # kernel half-width (channels)
-    range_cap = 3 * w                             # max window size for varlen scan
-    window_bins = int(math.floor(R)) + 1          # fixed window width
+    amp_2d = amplitude.reshape(1, -1)
+    freq_2d = frequency.reshape(1, -1)
 
-    # ---- trim buffer edges (varlen scans only) ----
-    buf = max(buffer, 0)
-    trim_start = buf
-    trim_end = n - buf
-    row_trimmed = x[trim_start:trim_end] if (trim_end - trim_start) > 2 else x
-    n_trimmed = row_trimmed.shape[0]
+    if SR > 1:
+        amp_sr_2d = _superresolve(amp_2d, SR)
+        freq_sr_2d = _superresolve(freq_2d, SR)
+        amp_sr = amp_sr_2d[0]
+        freq_sr = freq_sr_2d[0]
+        atm_sr = _superresolve_ranges([atm_ranges], SR)[0]
+        flag_sr = _superresolve_ranges([flag_ranges], SR)[0]
+        buffer_sr = buffer // SR
+    else:
+        amp_sr = amplitude
+        freq_sr = frequency
+        atm_sr = atm_ranges
+        flag_sr = flag_ranges
+        buffer_sr = buffer
 
-    if n_trimmed <= 2:
-        return {"masked": _BAD, "unmasked": _BAD, "fixed": _BAD}
+    out = _scan_row(
+        row=amp_sr.astype(np.float64),
+        ignore_ranges=atm_sr,
+        flag_ranges=flag_sr,
+        frequency=freq_sr,
+        buffer=buffer_sr,
+        sr_factor_val=SR,
+        kernel_kind=kernel_kind,
+    )
 
-    # ---- build truncated kernel vectors ----
-    k_vec = _truncated_kernel_vector(float(w), range_cap, kind=kernel_kind)
+    win_m_sr = out[1]      # masked window in SR coordinates
+    score_m = out[2]       # masked score (from SR scan)
+    w_native = out[6]      # w * SR
+    rc_native = out[7]     # range_cap * SR
+    win_u_sr = out[8]      # unmasked window in SR coordinates
+    score_u = out[9]       # unmasked score
+    ovl_u = out[10]        # unmasked overlap
+    win_f_sr = out[13]     # fixed window in SR coordinates
+    score_f = out[14]      # fixed score
+    ovl_f = out[15]        # fixed overlap
 
-    # ---- global SRA baselines ----
-    sra = _nwkr_sra(row_trimmed, k_vec)        # for varlen scoring
-    sra_full = _nwkr_sra(x, k_vec)             # for fixed-length scoring
+    if SR > 1:
+        win_m, win_u, win_f = _refine_all_windows(
+            spec_native=amplitude.astype(np.float64),
+            freq_native=frequency.astype(np.float64),
+            win_masked_sr=win_m_sr,
+            win_unmasked_sr=win_u_sr,
+            win_fixed_sr=win_f_sr,
+            atm_ranges=atm_ranges,
+            w_native=w_native,
+            range_cap_native=rc_native,
+            sr=SR,
+            buffer=buffer,
+            kernel_kind=kernel_kind,
+        )
+    else:
+        win_m = win_m_sr
+        win_u = win_u_sr
+        win_f = win_f_sr
 
-    # ---- build valid (non-flagged) index sets on trimmed row ----
-    ignore_trimmed: List[Tuple[int, int]] = []
-    for (s, e) in flag_ranges:
-        s0 = max(s - buf, 0)
-        e0 = min(e - buf, n_trimmed - 1)
-        if s0 <= e0:
-            ignore_trimmed.append((s0, e0))
-
-    mask = np.ones(n_trimmed, dtype=np.bool_)
-    for s0, e0 in ignore_trimmed:
-        mask[s0:e0 + 1] = False
-
-    all_trimmed = np.arange(n_trimmed, dtype=np.int64)
-    valid_masked = all_trimmed[mask]
-
-    # ----------------------------------------------------------------
-    # Variable-length window search
-    # ----------------------------------------------------------------
-    def _score_varlen(i: int, j: int, valid: np.ndarray) -> float:
-        """Score contiguous window [i,j] (trimmed coords) against valid set."""
-        inside = valid[(valid >= i) & (valid <= j)]
-        if inside.size == 0:
-            return -np.inf
-        outside = np.setdiff1d(all_trimmed, inside, assume_unique=False)
-        sri = _nwkr_sse_trunc(row_trimmed, inside, k_vec)
-        sro = _nwkr_sse_trunc(row_trimmed, outside, k_vec)
-        return 1.0 - (sri + sro) / sra
-
-    def _varlen_search(valid: np.ndarray) -> Tuple[int, int, float]:
-        """
-        Grow contiguous windows over ``valid`` (up to ``range_cap`` channels).
-        Returns ``(win_start, win_end, score)`` in **full-row** coordinates.
-        """
-        best_sc = 0.0
-        best_i = best_j = 0
-        n_valid = valid.shape[0]
-
-        if n_valid < 2:
-            return best_i + buf, best_j + buf, best_sc
-
-        for pos_i in range(n_valid):
-            i = int(valid[pos_i])
-
-            # require i is the start of a contiguous run in valid
-            if pos_i + 1 < n_valid and valid[pos_i + 1] != i + 1:
-                continue
-
-            max_k = min(pos_i + range_cap, n_valid - 1)
-            for k in range(pos_i + 1, max_k + 1):
-                if valid[k] != valid[k - 1] + 1:
-                    break
-                j = int(valid[k])
-                sc = _score_varlen(i, j, valid)
-                if sc > best_sc:
-                    best_sc = sc
-                    best_i, best_j = i, j
-
-        return best_i + buf, best_j + buf, float(best_sc)
-
-    # ----------------------------------------------------------------
-    # Fixed-length window sweep (full row, no buffer trimming)
-    # ----------------------------------------------------------------
-    def _fixedlen_sweep() -> Tuple[int, int, float]:
-        """
-        Slide a fixed window of ``window_bins`` channels over the full spectrum.
-        Returns ``(win_start, win_end, score)`` in full-row coordinates.
-        """
-        best_sc = 0.0
-        best_i = 0
-        best_j = max(window_bins - 1, 0)
-
-        if window_bins <= 0 or window_bins > n:
-            return best_i, best_j, best_sc
-
-        all_full = np.arange(n, dtype=np.int64)
-        max_start = n - window_bins
-
-        for i in range(max_start + 1):
-            j = i + window_bins - 1
-            inside = np.arange(i, j + 1, dtype=np.int64)
-            outside = np.setdiff1d(all_full, inside, assume_unique=True)
-            sri = _nwkr_sse_trunc(x, inside, k_vec)
-            sro = _nwkr_sse_trunc(x, outside, k_vec)
-            sc = 1.0 - (sri + sro) / sra_full
-            if sc > best_sc:
-                best_sc = sc
-                best_i, best_j = i, j
-
-        return best_i, best_j, float(best_sc)
-
-    # ---- run all three modes ----
-    m_start, m_end, m_score = _varlen_search(valid_masked)
-    u_start, u_end, u_score = _varlen_search(all_trimmed)
-    f_start, f_end, f_score = _fixedlen_sweep()
+    all_ignore = atm_ranges + flag_ranges
+    ovl_m = _overlap_fraction(win_m[0], win_m[1], all_ignore)
+    ovl_u_nat = _overlap_fraction(win_u[0], win_u[1], all_ignore) if SR > 1 else ovl_u
+    ovl_f_nat = _overlap_fraction(win_f[0], win_f[1], all_ignore) if SR > 1 else ovl_f
 
     return {
-        "masked":   Output(score=m_score, win_start=m_start, win_end=m_end),
-        "unmasked": Output(score=u_score, win_start=u_start, win_end=u_end),
-        "fixed":    Output(score=f_score, win_start=f_start, win_end=f_end),
+        "masked": Output(score=score_m, win_start=win_m[0], win_end=win_m[1],
+                         overlap_pct=ovl_m),
+        "unmasked": Output(score=score_u, win_start=win_u[0], win_end=win_u[1],
+                           overlap_pct=ovl_u_nat),
+        "fixed": Output(score=score_f, win_start=win_f[0], win_end=win_f[1],
+                        overlap_pct=ovl_f_nat),
     }
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# 12. Public entry point
+# ===========================================================================
 
 def compute_scan_statistics_scores(
     keyed_input: Dict[str, Input],
@@ -383,82 +1218,36 @@ def compute_scan_statistics_scores(
     buffer_divisor: int = _BUFFER_DIVISOR,
 ) -> Dict[str, ScanResult]:
     """
-    Entry point for computing scores on batched inputs.
+    Entry point for computing NWKR scan statistics on batched inputs.
 
     Parameters
     ----------
     keyed_input : Dict[str, Input]
-        A dictionary of unique key mapped to a set of input.
-    kernel_kind : str, optional
-        Kernel shape: ``"gaussian"`` (default) or ``"laplace"``.
-    buffer_divisor : int, optional
-        Edge buffer = ``len(frequency) // buffer_divisor``.  Default 20
-        gives ~5% on each side.
+        Unique key → Input(amplitude, frequency, flag_array, atm_ranges).
+    kernel_kind : str
+        ``"gaussian"`` (default) or ``"laplace"``.
+    buffer_divisor : int
+        Edge buffer = ``len(frequency) // buffer_divisor``.  Default 20.
 
     Returns
     -------
     Dict[str, ScanResult]
-        Two-level results keyed by input key, then by scan mode.
-
-        Example::
-
-            {
-                "key1": {
-                    "masked":   Output(score=..., win_start=..., win_end=...),
-                    "unmasked": Output(score=..., win_start=..., win_end=...),
-                    "fixed":    Output(score=..., win_start=..., win_end=...),
-                },
-                "key2": { ... },
-            }
 
     Notes
     -----
-    **Score definition** (identical to ``cosmicai.scan.scan_row_with_nwkr``)::
+    Score = 1 - (SSE_inside + SSE_outside) / SRA_global.
 
-        score = 1 - (SSE_inside + SSE_outside) / SRA_global
-
-    where SRA_global is the NWKR sum-of-squared residuals on the full array
-    and SSE is computed with a truncated Gaussian (or Laplace) kernel of
-    width ``w = round(ref_freq / freq_step)`` channels.
-
-    **Scan modes**
-
-    - ``"masked"``   — variable-length search restricted to *non-flagged*
-      channels.  Flagged channels (``flag_array=True``) are excluded from
-      both candidate windows and SSE evaluation.
-    - ``"unmasked"`` — same variable-length search over *all* channels.
-    - ``"fixed"``    — fixed-width window of
-      ``floor(ref_freq / freq_step) + 1`` channels swept over the full
-      spectrum (no edge trimming).
-
-    Rows that are all-zero, all-flagged, or too short return
-    ``Output(score=-inf, win_start=0, win_end=0)`` for all modes.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from scan_statistics import compute_scan_statistics_scores, Input
-    >>> rng  = np.random.default_rng(42)
-    >>> freq = np.linspace(85.0, 87.0, 512)
-    >>> amp  = rng.standard_normal(512)
-    >>> amp[200:240] += 8.0          # inject a bright spectral line
-    >>> flags = np.zeros(512, dtype=bool)
-    >>> flags[100:115] = True        # flag an atmospheric absorption region
-    >>> results = compute_scan_statistics_scores(
-    ...     {"obs_01": Input(amp, freq, flags)}
-    ... )
-    >>> r = results["obs_01"]
-    >>> print(r["masked"].score, r["masked"].win_start, r["masked"].win_end)
+    Scores are computed at superresolved resolution.
+    Windows are refined back to native resolution.
     """
     if not keyed_input:
         return {}
 
     results: Dict[str, ScanResult] = {}
-    _BAD = Output(score=-np.inf, win_start=0, win_end=0)
+    _BAD = Output(score=0., win_start=0, win_end=0, overlap_pct=0.0)
     _BAD_RESULT: ScanResult = {"masked": _BAD, "unmasked": _BAD, "fixed": _BAD}
 
     for key, inp in keyed_input.items():
-        # ---- coerce and validate ----
         try:
             amplitude = np.asarray(inp.amplitude, dtype=np.float64)
             frequency = np.asarray(inp.frequency, dtype=np.float64)
@@ -470,92 +1259,58 @@ def compute_scan_statistics_scores(
 
         if amplitude.ndim != 1 or frequency.ndim != 1 or flag_array.ndim != 1:
             raise ValueError(
-                f"[{key}] All arrays must be 1-D. "
-                f"Got shapes amplitude={amplitude.shape}, "
-                f"frequency={frequency.shape}, flag_array={flag_array.shape}."
+                f"[{key}] All arrays must be 1-D. Got shapes "
+                f"amplitude={amplitude.shape}, frequency={frequency.shape}, "
+                f"flag_array={flag_array.shape}."
             )
         if not (amplitude.shape == frequency.shape == flag_array.shape):
             raise ValueError(
-                f"[{key}] All arrays must have equal length. "
-                f"Got amplitude={amplitude.shape[0]}, "
-                f"frequency={frequency.shape[0]}, flag_array={flag_array.shape[0]}."
+                f"[{key}] All arrays must have equal length."
             )
 
-        # ---- skip degenerate rows ----
         if np.all(amplitude == 0.0):
-            logger.debug("[%s] Skipped: all-zero amplitude.", key)
             results[key] = _BAD_RESULT
             continue
         if flag_array.all():
-            logger.debug("[%s] Skipped: all channels flagged.", key)
             results[key] = _BAD_RESULT
             continue
 
-        # ---- derive buffer and flag ranges ----
         buffer = max(1, len(frequency) // buffer_divisor)
         flag_ranges = _flag_array_to_ranges(flag_array)
+        atm_ranges = inp.atm_ranges if inp.atm_ranges is not None else []
 
-        logger.debug(
-            "[%s] n=%d  buffer=%d  n_flag_ranges=%d  kernel=%s",
-            key, len(amplitude), buffer, len(flag_ranges), kernel_kind,
-        )
-
-        # ---- scan ----
         try:
             results[key] = _scan_single_row(
-                amplitude=amplitude,
-                frequency=frequency,
-                flag_ranges=flag_ranges,
-                buffer=buffer,
-                kernel_kind=kernel_kind,
+                amplitude, frequency, atm_ranges, flag_ranges,
+                buffer, kernel_kind,
             )
         except Exception as exc:
-            logger.warning("[%s] Scan raised an exception: %s", key, exc, exc_info=True)
+            logger.warning("[%s] Scan raised: %s", key, exc, exc_info=True)
             results[key] = _BAD_RESULT
 
     return results
 
 
-# =============================================================================
-# 9. CLI runner
-# =============================================================================
-
-def _flag_ranges_to_array(flag_ranges, n: int) -> np.ndarray:
-    """Convert flag_ranges list-of-tuples to boolean array."""
-    arr = np.zeros(n, dtype=bool)
-    if flag_ranges is None:
-        return arr
-    try:
-        for rng in flag_ranges:
-            if rng is None: continue
-            s, e = int(rng[0]), int(rng[1])
-            s = max(0, s); e = min(n - 1, e)
-            if s <= e: arr[s:e + 1] = True
-    except (TypeError, ValueError, IndexError):
-        pass
-    return arr
-
+# ===========================================================================
+# 13. CLI
+# ===========================================================================
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Run NWKR scan statistics on a single spectrum.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--amplitude",     required=True,
-                   help="Path to .npy file containing 1-D amplitude array.")
-    p.add_argument("--frequency",     required=True,
-                   help="Path to .npy file containing 1-D frequency array (GHz).")
-    p.add_argument("--flag-array",    default=None,
-                   help="Path to .npy file containing 1-D boolean flag array "
-                        "(True = flagged). Optional; defaults to all-False.")
-    p.add_argument("--interference",  default=None,
-                   help="Transmission table parquet/gzip for atm detection "
-                        "(columns: 'Frequency (GHz)', 'Transmission (%)'). Optional.")
-    p.add_argument("--key",           default="spectrum",
-                   help="Label for this spectrum in the output.")
-    p.add_argument("--kernel",        default="gaussian",
-                   choices=["gaussian", "laplace"])
-    p.add_argument("--log-level",     default="INFO",
+    p.add_argument("--amplitude", required=True,
+                   help=".npy file: 1-D float64 amplitude array.")
+    p.add_argument("--frequency", required=True,
+                   help=".npy file: 1-D float64 frequency array (GHz).")
+    p.add_argument("--flag-array", default=None,
+                   help=".npy file: 1-D bool flag array. Optional.")
+    p.add_argument("--interference", default=None,
+                   help="Transmission parquet for atmospheric detection. Optional.")
+    p.add_argument("--key", default="spectrum")
+    p.add_argument("--kernel", default="gaussian", choices=["gaussian", "laplace"])
+    p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
 
@@ -567,33 +1322,30 @@ def main() -> Dict[str, ScanResult]:
         format="%(levelname)s: %(message)s",
     )
 
-    # --- load arrays ---
-    amp  = np.load(args.amplitude).astype(np.float64)
+    amp = np.load(args.amplitude).astype(np.float64)
     freq = np.load(args.frequency).astype(np.float64)
-    n    = len(amp)
+    n = len(amp)
 
-    if args.flag_array:
-        flag_array = np.load(args.flag_array).astype(bool)
-    else:
-        flag_array = np.zeros(n, dtype=bool)
+    flag_array = np.load(args.flag_array).astype(bool) if args.flag_array else np.zeros(n, dtype=bool)
 
-    # --- atmospheric detection ---
     atm_ranges: List[Tuple[int, int]] = []
     if args.interference:
         trans_freqs, trans_vals = load_transmission(args.interference)
         atm_ranges = detect_atm_ranges(freq, trans_freqs, trans_vals)
 
-    # --- build input and run ---
-    keyed_input: Dict[str, Input] = {
-        args.key: Input(
-            amplitude  = amp,
-            frequency  = freq,
-            flag_array = flag_array,
-            atm_ranges = atm_ranges,
-        )
+    keyed_input = {
+        args.key: Input(amplitude=amp, frequency=freq,
+                        flag_array=flag_array, atm_ranges=atm_ranges)
     }
+    results = compute_scan_statistics_scores(keyed_input, kernel_kind=args.kernel)
 
-    return compute_scan_statistics_scores(keyed_input, kernel_kind=args.kernel)
+    for key, scan_result in results.items():
+        for mode, out in scan_result.items():
+            print(f"[{key}] {mode:10s}  score={out.score:.6f}  "
+                  f"window=[{out.win_start}, {out.win_end}]  "
+                  f"overlap={out.overlap_pct:.2%}")
+
+    return results
 
 
 if __name__ == "__main__":
