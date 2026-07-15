@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import math
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import groupby
 from typing import Dict, List, Literal, NamedTuple, Optional, Tuple, TypeAlias
 
@@ -27,7 +29,7 @@ import numpy as np
 from numba import njit
 
 # ===========================================================================
-# 1. Constants
+# 1. Constants (mirror helpers/config.py)
 # ===========================================================================
 
 _REF_FREQ: float = 0.0625          # GHz — reference spectral-line channel width
@@ -206,6 +208,7 @@ def _calculate_sra_trunc(array: np.ndarray, k: np.ndarray):
     Truncated-kernel NWKR SRA (global SSE baseline).
     Returns (sra, pred_array, numer_all, denom_all).
     Works for both Gaussian and Laplace since k already encodes the kernel shape.
+    Mirrors helpers.scoring.calculate_gaussian_sra_trunc.
     """
     n = array.shape[0]
     r = k.shape[0] - 1
@@ -721,7 +724,7 @@ def _derive_params(frequency: np.ndarray) -> Tuple[int, int, int, int]:
 
 def _overlap_fraction(a: int, b: int, ranges: List[Tuple[int, int]]) -> float:
     if b < a or not ranges:
-        return 0.
+        return 0.0
     wl = b - a + 1
     ov = 0
     for s, e in ranges:
@@ -741,236 +744,225 @@ def _scan_row(
     sr_factor_val: int,
     kernel_kind: str,
 ) -> Tuple:
-    """
-    Run scan on one row at its current resolution.
-
-    Returns a tuple:
-        (row_idx, wm, sm, pred_array, im, vm, w*sr_factor, range_cap*sr_factor,
-         wu, su, ovl_u, iu, vu, wf, sf, ovl_f, if_, vf, window_bins*sr_factor)
-    """
     is_gaussian = kernel_kind.lower() == "gaussian"
     n = row.shape[0]
     _bad_win = (0, -1)
-    _bad = (0., _bad_win, 0., np.array([]), None, None, 0, 0,
+    _bad = (0, _bad_win, 0., np.array([]), None, None, 0, 0,
             _bad_win, 0., 0., None, None, _bad_win, 0., 0., None, None, 0)
-
+ 
     if len(frequency) < 2 or not np.isfinite(frequency[:2]).all():
         return _bad
-
+ 
     w, kernel_cap, range_cap, window_bins = _derive_params(frequency)
     k_vector = _truncated_kernel_vector(float(w), kernel_cap, is_gaussian)
-
-    row_trimmed = row[buffer:n - buffer]
-    n_trimmed = row_trimmed.shape[0]
-    if n_trimmed <= 0:
-        return _bad
-
-    # SRA on trimmed (for varlen) and full (for fixed)
-    sra, pred_array, numer_all, denom_all = _calculate_sra_trunc(
-        row_trimmed.astype(np.float64), k_vector)
-    sra_full, _, numer_all_full, denom_all_full = _calculate_sra_trunc(
-        row.astype(np.float64), k_vector)
-    sra = max(sra, 1e-12)
-    sra_full = max(sra_full, 1e-12)
-
-    # Build masked valid set
-    ignore_trimmed: List[Tuple[int, int]] = []
-    for s, e in ignore_ranges:
-        s0 = max(s - buffer, 0)
-        e0 = min(e - buffer, n_trimmed - 1)
-        if s0 <= e0:
-            ignore_trimmed.append((s0, e0))
-    for s, e in flag_ranges:
-        s0 = max(s - buffer, 0)
-        e0 = min(e - buffer, n_trimmed - 1)
-        if s0 <= e0:
-            ignore_trimmed.append((s0, e0))
-
-    mask = np.ones(n_trimmed, dtype=np.bool_)
-    for s0, e0 in ignore_trimmed:
-        mask[s0:e0 + 1] = False
-    all_trimmed = np.arange(n_trimmed, dtype=np.int64)
-    valid_idxs_masked = np.nonzero(mask)[0]
-
+ 
+    _, pred_array, _, _ = _calculate_sra_trunc(row.astype(np.float64), k_vector)
+ 
+    buffer_ranges: List[Tuple[int, int]] = []
+    if buffer > 0:
+        buffer_ranges = [(0, buffer - 1), (n - buffer, n - 1)]
+ 
+    def _ranges_to_mask(rngs):
+        msk = np.ones(n, dtype=np.bool_)
+        for s, e in rngs:
+            s0 = max(s, 0); e0 = min(e, n - 1)
+            if s0 <= e0:
+                msk[s0:e0 + 1] = False
+        return msk
+ 
+    keep_masked   = np.nonzero(_ranges_to_mask(list(ignore_ranges) + list(flag_ranges) + buffer_ranges))[0]
+    keep_unmasked = np.nonzero(_ranges_to_mask(buffer_ranges + list(flag_ranges)))[0]
+    keep_fixed = np.nonzero(_ranges_to_mask(list(flag_ranges)))[0]
+ 
     REFRESH = max(1, range_cap)
-
-    # ------------------------------------------------------------------
-    # _varlen_search — incremental O(r) per inner step
-    # ------------------------------------------------------------------
-    def _varlen_search(valid: np.ndarray):
-        best_sc = 0.0
-        best_win = (0, -1)
-        best_idx_full = None
+ 
+    def _stats(srow):
+        s, _, num, den = _calculate_sra_trunc(srow.astype(np.float64), k_vector)
+        return max(s, 1e-12), num, den
+ 
+    def _varlen_search(srow, snumer, sdenom, ssra, keep):
+        best_sc   = 0.0
+        best_win  = (0, -1)
+        best_idx  = None
         best_vals = None
-
-        if len(valid) < 2:
-            return best_win, best_sc, best_idx_full, best_vals
-
-        n_valid = valid.shape[0]
-        cap = range_cap + 2
+ 
+        nf = srow.shape[0]
+        if nf < 2:
+            return best_win, best_sc, best_idx, best_vals
+ 
+        valid   = np.arange(nf, dtype=np.int64)
+        n_valid = nf
+ 
+        cap      = range_cap + 2
         buf_idxs = np.empty(cap, dtype=np.int64)
-        buf_num = np.empty(cap, dtype=np.float64)
-        buf_den = np.empty(cap, dtype=np.float64)
-        nin = np.zeros(n_trimmed, dtype=np.float64)
-        din = np.zeros(n_trimmed, dtype=np.float64)
-
-        carry_valid = False
+        buf_num  = np.empty(cap, dtype=np.float64)
+        buf_den  = np.empty(cap, dtype=np.float64)
+ 
+        nin = np.zeros(nf, dtype=np.float64)
+        din = np.zeros(nf, dtype=np.float64)
+ 
+        carry_valid    = False
         carry_left_idx = -1
         steps_since_refresh = 0
-
-        for pos_i in range(n_valid):
+ 
+        for pos_i in range(n_valid - 1):
             i = int(valid[pos_i])
-
-            if pos_i + 1 < n_valid and valid[pos_i + 1] != i + 1:
+ 
+            if keep[pos_i + 1] != keep[pos_i] + 1:
                 carry_valid = False
                 continue
-
+ 
             use_carry = carry_valid and carry_left_idx == i - 1
-
+ 
             if use_carry:
-                _nin_din_remove(row_trimmed, nin, din, i - 1, k_vector)
+                _nin_din_remove(srow, nin, din, i - 1, k_vector)
             else:
-                for ii in range(n_trimmed):
+                for ii in range(nf):
                     nin[ii] = 0.0
                     din[ii] = 0.0
                 steps_since_refresh = 0
-
+ 
             g_in_initialized = False
-            m = 0
+            m      = 0
             sse_in = 0.0
             sse_out = 0.0
-
+ 
             max_k = min(pos_i + range_cap, n_valid - 1)
-
+ 
             for kk in range(pos_i + 1, max_k + 1):
-                if valid[kk] != valid[kk - 1] + 1:
+                if keep[kk] != keep[kk - 1] + 1:
                     break
                 j = int(valid[kk])
-
+ 
                 if not g_in_initialized:
                     _nin_din_init_full(
-                        row_trimmed,
-                        np.array([i, j], dtype=np.int64),
+                        srow, np.array([i, j], dtype=np.int64),
                         k_vector, nin, din)
                     m, sse_in = _buf_init(
-                        row_trimmed,
-                        np.array([i, j], dtype=np.int64),
+                        srow, np.array([i, j], dtype=np.int64),
                         k_vector, buf_idxs, buf_num, buf_den)
                     sse_out = _sse_out_from_nin_din(
-                        row_trimmed, numer_all, denom_all, nin, din, buf_idxs, m)
+                        srow, snumer, sdenom, nin, din, buf_idxs, m)
                     steps_since_refresh = 0
                     g_in_initialized = True
                 else:
-                    _nin_din_add(row_trimmed, nin, din, j, k_vector)
+                    _nin_din_add(srow, nin, din, j, k_vector)
                     m, sse_in = _buf_add(
-                        row_trimmed, j, k_vector, buf_idxs, buf_num, buf_den, m, sse_in)
+                        srow, j, k_vector, buf_idxs, buf_num, buf_den, m, sse_in)
                     sse_out = _sse_out_add(
-                        row_trimmed, numer_all, denom_all, nin, din,
+                        srow, snumer, sdenom, nin, din,
                         buf_idxs, m, j, k_vector, sse_out)
                     steps_since_refresh += 1
                     if steps_since_refresh >= REFRESH:
                         sse_out = _sse_out_from_nin_din(
-                            row_trimmed, numer_all, denom_all, nin, din, buf_idxs, m)
+                            srow, snumer, sdenom, nin, din, buf_idxs, m)
                         steps_since_refresh = 0
-
-                sc = 1.0 - (sse_in + sse_out) / sra
+ 
+                sc = 1.0 - (sse_in + sse_out) / ssra
                 if sc > best_sc:
-                    best_sc = sc
-                    best_win = (i, j)
-                    best_idx_full = buf_idxs[:m].copy() + buffer
+                    best_sc   = sc
+                    best_win  = (i, j)
+                    best_idx  = buf_idxs[:m].copy()
                     best_vals = _predict_on_idxs_trunc(
-                        row_trimmed, buf_idxs[:m].copy(), k_vector)
-
+                        srow, buf_idxs[:m].copy(), k_vector)
+ 
             if g_in_initialized:
-                carry_valid = True
+                carry_valid    = True
                 carry_left_idx = int(i)
             else:
                 carry_valid = False
-
-        oi, oj = best_win
-        return (oi + buffer, oj + buffer), best_sc, best_idx_full, best_vals
-
-    # ------------------------------------------------------------------
-    # _fixedlen_sweep — O(n*r) total
-    # ------------------------------------------------------------------
-    def _fixedlen_sweep():
-        best_sc = 0.0
-        best_win = (0, -1)
-        best_idx_full = None
+ 
+        return best_win, best_sc, best_idx, best_vals
+ 
+    def _fixedlen_sweep(srow, snumer, sdenom, ssra, keep):
+        best_sc   = 0.0
+        best_win  = (0, -1)
+        best_idx  = None
         best_vals = None
-
-        if window_bins <= 0 or window_bins > n:
-            return best_win, best_sc, best_idx_full, best_vals
-
-        cap = window_bins + 1
-        buf_idxs_f = np.empty(cap, dtype=np.int64)
-        buf_num_f = np.empty(cap, dtype=np.float64)
-        buf_den_f = np.empty(cap, dtype=np.float64)
-        nin_f = np.zeros(n, dtype=np.float64)
-        din_f = np.zeros(n, dtype=np.float64)
-
-        m = 0
-        sse_in = 0.0
-        sse_out = 0.0
-        g_in_initialized = False
-        steps = 0
-
-        for i in range(n - window_bins + 1):
+ 
+        nf = srow.shape[0]
+        if window_bins <= 0 or window_bins > nf:
+            return best_win, best_sc, best_idx, best_vals
+ 
+        cap      = window_bins + 1
+        buf_idxs = np.empty(cap, dtype=np.int64)
+        buf_num  = np.empty(cap, dtype=np.float64)
+        buf_den  = np.empty(cap, dtype=np.float64)
+        nin      = np.zeros(nf, dtype=np.float64)
+        din      = np.zeros(nf, dtype=np.float64)
+ 
+        m = 0; sse_in = 0.0; sse_out = 0.0
+        g_in_initialized = False; steps = 0
+ 
+        for i in range(nf - window_bins + 1):
             j = i + window_bins - 1
+ 
+            if keep[j] - keep[i] != window_bins - 1:
+                g_in_initialized = False
+                continue
+ 
             inside = np.arange(i, i + window_bins, dtype=np.int64)
-
+ 
             if not g_in_initialized:
-                _nin_din_init_full(row, inside, k_vector, nin_f, din_f)
-                m, sse_in = _buf_init(row, inside, k_vector,
-                                      buf_idxs_f, buf_num_f, buf_den_f)
+                _nin_din_init_full(srow, inside, k_vector, nin, din)
+                m, sse_in = _buf_init(srow, inside, k_vector,
+                                      buf_idxs, buf_num, buf_den)
                 sse_out = _sse_out_from_nin_din(
-                    row, numer_all_full, denom_all_full, nin_f, din_f,
-                    buf_idxs_f, m)
-                steps = 0
-                g_in_initialized = True
+                    srow, snumer, sdenom, nin, din, buf_idxs, m)
+                steps = 0; g_in_initialized = True
             else:
-                rem = np.int64(i - 1)
-                add = np.int64(j)
-                _nin_din_remove(row, nin_f, din_f, rem, k_vector)
-                m, sse_in = _buf_remove(row, rem, k_vector,
-                                        buf_idxs_f, buf_num_f, buf_den_f, m, sse_in)
+                rem = np.int64(i - 1); add = np.int64(j)
+                _nin_din_remove(srow, nin, din, rem, k_vector)
+                m, sse_in = _buf_remove(srow, rem, k_vector,
+                                        buf_idxs, buf_num, buf_den, m, sse_in)
                 sse_out = _sse_out_remove(
-                    row, numer_all_full, denom_all_full, nin_f, din_f,
-                    buf_idxs_f, m, rem, k_vector, sse_out)
-                _nin_din_add(row, nin_f, din_f, add, k_vector)
-                m, sse_in = _buf_add(row, add, k_vector,
-                                     buf_idxs_f, buf_num_f, buf_den_f, m, sse_in)
+                    srow, snumer, sdenom, nin, din,
+                    buf_idxs, m, rem, k_vector, sse_out)
+                _nin_din_add(srow, nin, din, add, k_vector)
+                m, sse_in = _buf_add(srow, add, k_vector,
+                                     buf_idxs, buf_num, buf_den, m, sse_in)
                 sse_out = _sse_out_add(
-                    row, numer_all_full, denom_all_full, nin_f, din_f,
-                    buf_idxs_f, m, add, k_vector, sse_out)
+                    srow, snumer, sdenom, nin, din,
+                    buf_idxs, m, add, k_vector, sse_out)
                 steps += 1
                 if steps >= REFRESH:
                     sse_out = _sse_out_from_nin_din(
-                        row, numer_all_full, denom_all_full, nin_f, din_f,
-                        buf_idxs_f, m)
+                        srow, snumer, sdenom, nin, din, buf_idxs, m)
                     steps = 0
-
-            sc = 1.0 - (sse_in + sse_out) / sra_full
+ 
+            sc = 1.0 - (sse_in + sse_out) / ssra
             if sc > best_sc:
-                best_sc = sc
-                best_win = (i, j)
-                best_idx_full = inside.copy()
-                best_vals = _predict_on_idxs_trunc(row, inside, k_vector)
-
-        return best_win, best_sc, best_idx_full, best_vals
-
-    wm, sm, im, vm = _varlen_search(valid_idxs_masked)
-    wu, su, iu, vu = _varlen_search(all_trimmed)
+                best_sc   = sc
+                best_win  = (i, j)
+                best_idx  = inside.copy()
+                best_vals = _predict_on_idxs_trunc(srow, inside, k_vector)
+ 
+        return best_win, best_sc, best_idx, best_vals
+ 
+    def _run(keep, search_fn):
+        if keep.shape[0] < 2:
+            return (0, -1), 0., None, None
+        srow = row[keep].astype(np.float64)
+        ssra, snum, sden = _stats(srow)
+        (oi, oj), sc, idx_f, vals = search_fn(srow, snum, sden, ssra, keep)
+        if oj < oi:
+            return (0, -1), sc, None, None
+        win      = (int(keep[oi]), int(keep[oj]))
+        idx_orig = keep[idx_f] if idx_f is not None else None
+        return win, sc, idx_orig, vals
+ 
+    # Run all three
+    wm, sm, im, vm = _run(keep_masked, _varlen_search)
+    wu, su, iu, vu = _run(keep_unmasked, _varlen_search)
     ovl_u = _overlap_fraction(wu[0], wu[1], ignore_ranges)
-    wf, sf, if_, vf = _fixedlen_sweep()
+    wf, sf, if_, vf = _run(keep_fixed, _fixedlen_sweep)
     ovl_f = _overlap_fraction(wf[0], wf[1], ignore_ranges)
-
+ 
     return (0, wm, sm, pred_array, im, vm,
             w * sr_factor_val, range_cap * sr_factor_val,
             wu, su, ovl_u, iu, vu,
             wf, sf, ovl_f, if_, vf,
             window_bins * sr_factor_val)
-
 
 # ===========================================================================
 # 9. Superresolution refinement
@@ -1211,11 +1203,55 @@ def _scan_single_row(
 # 12. Public entry point
 # ===========================================================================
 
+def _process_single_key(
+    key: str,
+    amplitude: np.ndarray,
+    frequency: np.ndarray,
+    flag_array: np.ndarray,
+    atm_ranges: Optional[List[Tuple[int, int]]],
+    kernel_kind: str,
+    buffer_divisor: int,
+) -> Tuple[str, ScanResult]:
+    """
+    Worker function for a single key.  Pickle-friendly (top-level function).
+    """
+    _BAD = Output(score=0., win_start=0, win_end=0, overlap_pct=0.0)
+    _BAD_RESULT: ScanResult = {"masked": _BAD, "unmasked": _BAD, "fixed": _BAD}
+
+    try:
+        amplitude = np.asarray(amplitude, dtype=np.float64)
+        frequency = np.asarray(frequency, dtype=np.float64)
+        flag_array = np.asarray(flag_array, dtype=bool)
+    except Exception:
+        return key, _BAD_RESULT
+
+    if amplitude.ndim != 1 or frequency.ndim != 1 or flag_array.ndim != 1:
+        return key, _BAD_RESULT
+    if not (amplitude.shape == frequency.shape == flag_array.shape):
+        return key, _BAD_RESULT
+    if np.all(amplitude == 0.0) or flag_array.all():
+        return key, _BAD_RESULT
+
+    buffer = max(1, len(frequency) // buffer_divisor)
+    flag_ranges = _flag_array_to_ranges(flag_array)
+    atm = atm_ranges if atm_ranges is not None else []
+
+    try:
+        result = _scan_single_row(
+            amplitude, frequency, atm, flag_ranges,
+            buffer, kernel_kind,
+        )
+        return key, result
+    except Exception:
+        return key, _BAD_RESULT
+
+
 def compute_scan_statistics_scores(
     keyed_input: Dict[str, Input],
     *,
     kernel_kind: str = _DEFAULT_KERNEL,
     buffer_divisor: int = _BUFFER_DIVISOR,
+    max_workers: Optional[int] = None,
 ) -> Dict[str, ScanResult]:
     """
     Entry point for computing NWKR scan statistics on batched inputs.
@@ -1228,6 +1264,12 @@ def compute_scan_statistics_scores(
         ``"gaussian"`` (default) or ``"laplace"``.
     buffer_divisor : int
         Edge buffer = ``len(frequency) // buffer_divisor``.  Default 20.
+    max_workers : int or None
+        Number of parallel worker processes.
+        ``None`` or ``0`` → sequential (no multiprocessing).
+        ``1`` → sequential (no multiprocessing).
+        ``>1`` → parallel with that many workers.
+        ``-1`` → use ``os.cpu_count()`` workers.
 
     Returns
     -------
@@ -1237,15 +1279,28 @@ def compute_scan_statistics_scores(
     -----
     Score = 1 - (SSE_inside + SSE_outside) / SRA_global.
 
-    Scores are computed at superresolved resolution.
+    Scores are computed at superresolved resolution (matching calculate_stats.py).
     Windows are refined back to native resolution.
+
+    For large batches (thousands of rows), use ``max_workers=-1`` to parallelize
+    across CPU cores, matching the ``ProcessPoolExecutor`` approach in
+    ``calculate_stats.py``.
     """
     if not keyed_input:
         return {}
 
-    results: Dict[str, ScanResult] = {}
+    # Resolve worker count
+    n_workers = max_workers
+    if n_workers is None or n_workers == 0:
+        n_workers = 1
+    elif n_workers == -1:
+        n_workers = os.cpu_count() or 1
+
+    # Build work items
+    work_items = []
     _BAD = Output(score=0., win_start=0, win_end=0, overlap_pct=0.0)
     _BAD_RESULT: ScanResult = {"masked": _BAD, "unmasked": _BAD, "fixed": _BAD}
+    results: Dict[str, ScanResult] = {}
 
     for key, inp in keyed_input.items():
         try:
@@ -1268,25 +1323,44 @@ def compute_scan_statistics_scores(
                 f"[{key}] All arrays must have equal length."
             )
 
-        if np.all(amplitude == 0.0):
-            results[key] = _BAD_RESULT
-            continue
-        if flag_array.all():
-            results[key] = _BAD_RESULT
-            continue
-
-        buffer = max(1, len(frequency) // buffer_divisor)
-        flag_ranges = _flag_array_to_ranges(flag_array)
         atm_ranges = inp.atm_ranges if inp.atm_ranges is not None else []
+        work_items.append((key, amplitude, frequency, flag_array, atm_ranges))
 
-        try:
-            results[key] = _scan_single_row(
-                amplitude, frequency, atm_ranges, flag_ranges,
-                buffer, kernel_kind,
+    if not work_items:
+        return results
+
+    # ---- Sequential path ----
+    if n_workers <= 1 or len(work_items) == 1:
+        for key, amp, freq, flags, atm in work_items:
+            k, r = _process_single_key(
+                key, amp, freq, flags, atm, kernel_kind, buffer_divisor,
             )
-        except Exception as exc:
-            logger.warning("[%s] Scan raised: %s", key, exc, exc_info=True)
-            results[key] = _BAD_RESULT
+            results[k] = r
+        return results
+
+    # ---- Parallel path ----
+    logger.info("Running %d rows across %d workers", len(work_items), n_workers)
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {}
+        for key, amp, freq, flags, atm in work_items:
+            fut = pool.submit(
+                _process_single_key,
+                key, amp, freq, flags, atm, kernel_kind, buffer_divisor,
+            )
+            futures[fut] = key
+
+        done_count = 0
+        for fut in as_completed(futures):
+            done_count += 1
+            try:
+                k, r = fut.result()
+                results[k] = r
+            except Exception as exc:
+                k = futures[fut]
+                logger.warning("[%s] Worker raised: %s", k, exc)
+                results[k] = _BAD_RESULT
+            if done_count % 500 == 0:
+                logger.info("  %d/%d done", done_count, len(work_items))
 
     return results
 
