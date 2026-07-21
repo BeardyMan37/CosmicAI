@@ -3,163 +3,143 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Regression Scan Statistics for ALMA Platforming</title>
-  <meta name="description" content="Project page for regression scan statistics and NWKR-based interval anomaly detection for ALMA QA2 platforming artifacts." />
-  <meta property="og:title" content="Regression Scan Statistics for ALMA Platforming" />
-  <meta property="og:description" content="An interpretable scan-statistic approach for detecting localized platforming artifacts in ALMA QA2 calibration spectra." />
+  <title>Scan Statistics for Interval Anomalies</title>
+  <meta name="description" content="A general-purpose scan statistics tool for interval anomalies in smooth signals, with ALMA platforming as one application." />
+  <meta property="og:title" content="Scan Statistics for Interval Anomalies" />
+  <meta property="og:description" content="General-purpose scan statistics for interval anomalies. ALMA platforming is one application." />
   <meta property="og:type" content="website" />
   <meta name="theme-color" content="#0b6f6a" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <header class="hero">
+  <header class="hero" id="top">
     <nav class="nav" aria-label="Main navigation">
-      <a class="brand" href="#top" aria-label="Project home">ALMA Platforming</a>
+      <a class="brand" href="#top">Scan Statistics</a>
       <div class="nav-links">
-        <a href="#problem">Problem</a>
-        <a href="#method">Method</a>
-        <a href="#results">Results</a>
+        <a href="#overview">Overview</a>
+        <a href="#applications">Applications</a>
+        <a href="#datasets">Datasets</a>
         <a href="#code">Code</a>
       </div>
     </nav>
 
-    <section id="top" class="hero-content">
-      <p class="eyebrow">Cosmic Horizons / ALMA QA2</p>
-      <h1>Regression Scan Statistics for ALMA Platforming</h1>
+    <section class="hero-content">
+      <p class="eyebrow">General-purpose interval anomaly detection</p>
+      <h1>Scan statistics for smooth signals.</h1>
       <p class="lede">
-        An interpretable interval-anomaly detector for ALMA QA2 calibration spectra. The method searches for compact platforming artifacts while preserving smooth, non-flat bandpass structure.
+        A general scan-statistics tool for finding compact anomalous intervals in spectra, time series, and other smoothly varying signals. It keeps the background model interpretable, returns an auditable interval, and scales to QA workflows.
       </p>
       <div class="hero-actions">
-        <a class="button primary" href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">View code on GitHub</a>
-        <a class="button secondary" href="#method">How it works</a>
+        <a class="button primary" href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">View code base</a>
+        <a class="button secondary" href="#applications">See applications</a>
       </div>
 
-      <div class="logo-strip" aria-label="Project collaborators and sponsors">
-        <span class="logo-label">Collaborators and support</span>
-        <img src="assets/cosmicai_logo.png" alt="CosmicAI logo" />
-        <img src="assets/nsf_logo.png" alt="National Science Foundation logo" />
-        <img src="assets/simons_logo.png" alt="Simons Foundation logo" />
+      <div class="hero-highlights" aria-label="Highlights">
+        <div class="highlight"><strong>Interval score</strong><span>one compact window vs. the rest</span></div>
+        <div class="highlight"><strong>Auditable output</strong><span>score, interval, background</span></div>
+        <div class="highlight"><strong>Efficient updates</strong><span>reuse overlapping scan state</span></div>
       </div>
     </section>
   </header>
 
   <main>
-    <section id="problem" class="section two-col">
+    <section id="overview" class="section split">
       <div>
-        <p class="section-label">The astronomy problem</p>
-        <h2>Localized calibration artifacts can propagate into science products.</h2>
+        <p class="section-label">What it does</p>
+        <h2>Fit smooth backgrounds, score candidate intervals, and return the strongest anomaly.</h2>
         <p>
-          ALMA bandpass calibration spectra are an early checkpoint before science-ready hyperspectral cubes are built. Platforming appears as a compact amplitude offset over contiguous frequency channels. It can look small in one row, but downstream it can introduce non-astrophysical structure.
+          The method compares a single smooth fit against separate inside/outside fits for each candidate interval. A large score means separating one interval explains the signal much better than forcing a single background model.
         </p>
-        <p>
-          A useful detector should identify the affected row, localize the implicated frequency interval, and provide a smooth fitted background for auditability.
-        </p>
+        <div class="callout">
+          <div class="formula">S(I<sub>a,b</sub>) = 1 - (SSE<sub>in</sub>(I<sub>a,b</sub>) + SSE<sub>out</sub>(I<sub>a,b</sub>)) / SSE<sub>all</sub></div>
+          <p>That score is then maximized over intervals to produce an auditable flag.</p>
+        </div>
       </div>
-      <div class="card signal-card" aria-label="Stylized platforming signal">
-        <svg viewBox="0 0 640 260" role="img" aria-labelledby="signal-title signal-desc">
-          <title id="signal-title">Stylized ALMA platforming spectrum</title>
-          <desc id="signal-desc">A smooth spectrum with a compact amplitude drop highlighted as platforming.</desc>
-          <rect x="42" y="32" width="556" height="180" rx="12" fill="#f8fafc" stroke="#d7e2ea" />
-          <path d="M65,130 C120,112 158,138 208,122 C252,108 282,116 302,118 C312,120 314,176 322,184 C332,196 350,196 360,182 C370,166 370,124 382,118 C450,106 492,104 570,126" fill="none" stroke="#1f77b4" stroke-width="4" />
-          <path d="M302,48 L380,48 L380,208 L302,208 Z" fill="#f2b84b" opacity="0.20" />
-          <path d="M302,48 L302,208 M380,48 L380,208" stroke="#bd6b00" stroke-width="3" stroke-dasharray="8 7" />
-          <text x="315" y="232" fill="#bd1f2d" font-size="22" font-weight="700">platforming interval</text>
-          <path d="M318,218 L326,190" stroke="#bd1f2d" stroke-width="3" marker-end="url(#arrow)" />
+      <div class="card signal-card" aria-label="Stylized interval anomaly illustration">
+        <svg viewBox="0 0 760 300" role="img" aria-labelledby="signal-title signal-desc">
+          <title id="signal-title">Stylized scan-statistic signal</title>
+          <desc id="signal-desc">A smooth signal with a compact anomalous interval highlighted in the middle.</desc>
           <defs>
             <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#bd1f2d" />
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#b94634" />
             </marker>
           </defs>
+          <rect x="34" y="28" width="692" height="218" rx="16" fill="#f8fafc" stroke="#d7e2ea" />
+          <path d="M60,150 C120,120 170,168 220,138 C270,108 320,122 360,128 C372,130 376,188 385,198 C395,210 420,208 430,194 C441,176 438,134 452,128 C510,104 570,110 704,146" fill="none" stroke="#0f172a" stroke-width="5" />
+          <rect x="344" y="48" width="110" height="166" fill="#f4b942" opacity="0.18" rx="6" />
+          <line x1="344" y1="48" x2="344" y2="214" stroke="#b57400" stroke-width="3.5" stroke-dasharray="10 8" />
+          <line x1="454" y1="48" x2="454" y2="214" stroke="#b57400" stroke-width="3.5" stroke-dasharray="10 8" />
+          <path d="M360,210 C360,214 368,222 372,228" stroke="#b94634" stroke-width="4" fill="none" marker-end="url(#arrow)" />
+          <text x="305" y="263" fill="#b94634" font-size="24" font-weight="700">platforming interval</text>
         </svg>
       </div>
     </section>
 
-    <section id="method" class="section">
-      <p class="section-label">Method</p>
-      <h2>Scan intervals, fit smooth backgrounds, return an auditable score.</h2>
-      <div class="steps">
-        <article class="step-card">
-          <span class="step-number">1</span>
-          <h3>Search candidate intervals</h3>
-          <p>Platforming is treated as a localized interval anomaly rather than a point anomaly or two unrelated changepoints.</p>
-        </article>
-        <article class="step-card">
-          <span class="step-number">2</span>
-          <h3>Fit inside and outside</h3>
-          <p>The score compares one global smooth fit against separate fits for the candidate interval and the remaining channels.</p>
-        </article>
-        <article class="step-card">
-          <span class="step-number">3</span>
-          <h3>Use NWKR for local smoothness</h3>
-          <p>Nadaraya-Watson kernel regression follows broad bandpass curvature without forcing a single global polynomial.</p>
-        </article>
-        <article class="step-card">
-          <span class="step-number">4</span>
-          <h3>Update efficiently</h3>
-          <p>Cached scan state and local kernel support turn brute-force rescoring into efficient streaming-style updates.</p>
+    <section id="applications" class="section">
+      <p class="section-label">Application</p>
+      <h2>ALMA platforming is one concrete use case.</h2>
+      <div class="application-grid">
+        <article class="card app-card">
+          <div class="app-copy">
+            <h3>ALMA QA2 platforming</h3>
+            <p>
+              Calibration spectra are smooth but not flat. Platforming is a compact instrumental offset that can propagate into science cubes if it is not flagged early.
+            </p>
+            <ul>
+              <li>Localized interval anomaly in frequency space</li>
+              <li>Returns a row score, interval, and fitted background</li>
+              <li>Designed for review-friendly QA2 screening</li>
+            </ul>
+            <a class="button secondary" href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">Open the study code</a>
+          </div>
+          <div class="app-figure">
+            <img src="assets/alma_platforming.png" alt="ALMA platforming illustration" />
+          </div>
         </article>
       </div>
     </section>
 
-    <section class="section formula-section">
-      <div class="formula-card">
-        <p class="section-label">Regression scan statistic</p>
-        <p class="formula">S(I<sub>a,b</sub>) = 1 - (SSE<sub>in</sub>(I<sub>a,b</sub>) + SSE<sub>out</sub>(I<sub>a,b</sub>)) / SSE<sub>all</sub></p>
-        <p>
-          A large score means one compact interval explains the spectrum much better when separated from the smooth background. The detector reports the maximum-scoring interval and its score.
-        </p>
-      </div>
-    </section>
-
-    <section id="results" class="section">
-      <p class="section-label">Evaluation snapshot</p>
-      <h2>QA2-scale screening with interpretable outputs.</h2>
-      <div class="metrics">
-        <div class="metric"><strong>38,881</strong><span>ALMA spectra screened</span></div>
-        <div class="metric"><strong>231</strong><span>confirmed platforming rows</span></div>
-        <div class="metric"><strong>1.000</strong><span>recall at the selected threshold</span></div>
-        <div class="metric"><strong>0</strong><span>false negatives in score-only screening</span></div>
-      </div>
-      <div class="result-grid">
-        <article class="card">
-          <h3>What the detector returns</h3>
-          <ul>
-            <li>Suspicion score for each spectrum</li>
-            <li>Frequency interval causing the flag</li>
-            <li>Fitted smooth background</li>
-            <li>Review-ready evidence for QA workflows</li>
-          </ul>
+    <section id="datasets" class="section">
+      <p class="section-label">Datasets</p>
+      <h2>Two evaluation datasets are linked here.</h2>
+      <div class="dataset-grid">
+        <article class="card dataset-card">
+          <p class="dataset-tag">Dataset 1</p>
+          <h3>ALMA QA2 cleaned evaluation set</h3>
+          <p>
+            Cleaned calibration spectra used to study interval localization and screening performance for the platforming application.
+          </p>
+          <div class="button-row">
+            <a class="button primary" href="https://github.com/BeardyMan37/RegressionScanStats/blob/main/create_dataset.py" target="_blank" rel="noopener">Open dataset builder</a>
+            <a class="button secondary" href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">Code base</a>
+          </div>
         </article>
-        <article class="card">
-          <h3>Why it matters</h3>
-          <ul>
-            <li>Platforming is rare but scientifically consequential</li>
-            <li>False negatives can corrupt downstream data products</li>
-            <li>Interval localization supports human inspection</li>
-            <li>The method is designed for scalable QA2 screening</li>
-          </ul>
-        </article>
-      </div>
-    </section>
 
-    <section class="section support-section" aria-labelledby="support-heading">
-      <p class="section-label">Collaborators and support</p>
-      <h2 id="support-heading">Built with CosmicAI collaborators and research support.</h2>
-      <div class="large-logo-row">
-        <img src="assets/cosmicai_logo.png" alt="CosmicAI logo" />
-        <img src="assets/nsf_logo.png" alt="National Science Foundation logo" />
-        <img src="assets/simons_logo.png" alt="Simons Foundation logo" />
+        <article class="card dataset-card">
+          <p class="dataset-tag">Dataset 2</p>
+          <h3>Synthetic benchmark suite</h3>
+          <p>
+            Controlled synthetic signals used for runtime and localization experiments across signal-to-noise and anomaly-width sweeps.
+          </p>
+          <div class="button-row">
+            <a class="button primary" href="https://github.com/BeardyMan37/RegressionScanStats/blob/main/benchmark_regressor_on_syth.py" target="_blank" rel="noopener">Open benchmark script</a>
+            <a class="button secondary" href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">Code base</a>
+          </div>
+        </article>
       </div>
     </section>
 
     <section id="code" class="section code-section">
       <div>
         <p class="section-label">Code base</p>
-        <h2>Explore the implementation.</h2>
+        <h2>Implementation, evaluation, and dataset construction live in the repository.</h2>
         <p>
-          The repository contains the scan-statistic implementation, NWKR support, scoring utilities, dataset construction scripts, and benchmark/evaluation code used for the ALMA platforming study.
+          The repository includes the scan statistic implementation, NWKR support, scoring utilities, dataset construction scripts, and benchmark code.
         </p>
-        <a class="button primary" href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">Open RegressionScanStats</a>
+        <a class="button primary" href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">View RegressionScanStats on GitHub</a>
       </div>
       <pre><code>git clone https://github.com/BeardyMan37/RegressionScanStats.git
 cd RegressionScanStats</code></pre>
@@ -167,7 +147,12 @@ cd RegressionScanStats</code></pre>
   </main>
 
   <footer class="footer">
-    <p>Regression Scan Statistics for ALMA Platforming</p>
+    <div class="logo-row" aria-label="Support logos">
+      <img src="assets/cosmicai_logo.png" alt="CosmicAI logo" />
+      <img src="assets/nsf_logo.png" alt="National Science Foundation logo" />
+      <img src="assets/simons_logo.png" alt="Simons Foundation logo" />
+    </div>
+    <p>Scan statistics for interval anomalies, with ALMA platforming as a featured application.</p>
     <p><a href="https://github.com/BeardyMan37/RegressionScanStats" target="_blank" rel="noopener">GitHub repository</a></p>
   </footer>
 </body>
