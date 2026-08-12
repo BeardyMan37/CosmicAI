@@ -84,7 +84,17 @@ def _score_one_row(
 # Main experiment
 # ---------------------------------------------------------------------------
 
-SERIAL_METHODS = {"stumpy"}
+try:
+    from helpers.deep_baselines import DEEP_METHODS as _DEEP_METHODS
+    _DEEP_KEYS = set(_DEEP_METHODS)
+except Exception:
+    _DEEP_KEYS = set()
+
+# stumpy: numba/OpenMP conflict in subprocesses.
+# deep baselines: torch state does not survive fork reliably, and each worker
+# would otherwise reload the model artifact.
+SERIAL_METHODS = {"stumpy"} | _DEEP_KEYS
+
 def run_score_experiment(
     *,
     parquet_path: str,

@@ -23,6 +23,12 @@ from .regressors import (
 )
 from .predictors import predict_on_idxs_trunc
 
+FIX_FIRST_START = False
+
+def set_fix_first_start(flag: bool):
+    global FIX_FIRST_START
+    FIX_FIRST_START = bool(flag)
+
 
 def predict_subset_using_regressor(x, idxs, family, **kwargs):
     family = family.lower()
@@ -212,7 +218,8 @@ def scan_row_with_nwkr(params: Tuple):
         valid   = np.arange(nf, dtype=np.int64)
         n_valid = nf
 
-        cap      = range_cap + 2
+        # cap      = range_cap + 2
+        cap      = n_valid + 1
         buf_idxs = np.empty(cap, dtype=np.int64)
         buf_num  = np.empty(cap, dtype=np.float64)
         buf_den  = np.empty(cap, dtype=np.float64)
@@ -226,7 +233,9 @@ def scan_row_with_nwkr(params: Tuple):
         carry_sse_out   = 0.
         steps_since_refresh = 0
 
-        for pos_i in range(n_valid - 1):
+        start_iter = range(0, 1) if FIX_FIRST_START else range(0, n_valid - 1)
+        for pos_i in start_iter:
+        # for pos_i in range(n_valid - 1):
             i = int(valid[pos_i])
 
             if keep[pos_i + 1] != keep[pos_i] + 1:
@@ -248,7 +257,8 @@ def scan_row_with_nwkr(params: Tuple):
             sse_in = 0.
             sse_out = 0.
 
-            max_k = min(pos_i + range_cap, n_valid - 1)
+            # max_k = min(pos_i + range_cap, n_valid - 1)
+            max_k = n_valid - 1 if FIX_FIRST_START else min(pos_i + range_cap, nf, n_valid - 1)
 
             for kk in range(pos_i + 1, max_k + 1):
                 if keep[kk] != keep[kk - 1] + 1:

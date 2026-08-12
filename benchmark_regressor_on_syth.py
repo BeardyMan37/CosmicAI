@@ -46,9 +46,9 @@ Method keys (pass to --methods)
 """
 from __future__ import annotations
 
-import logging
-for logger_name in ["kats", "kats.detectors", "kats.models", "kats.utils"]:
-    logging.getLogger(logger_name).setLevel(logging.ERROR)
+# import logging
+# for logger_name in ["kats", "kats.detectors", "kats.models", "kats.utils"]:
+#     logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 import argparse
 import logging
@@ -68,8 +68,8 @@ import stumpy
 import ruptures as rpt
 from helpers.superres import refine_all_windows_exact_for_length, superresolve
 from gen_ar2_data import generate_ar2_dataset
-from kats.consts import TimeSeriesData
-from kats.detectors.cusum_detection import CUSUMDetector
+# from kats.consts import TimeSeriesData
+# from kats.detectors.cusum_detection import CUSUMDetector
 
 from helpers.config import KernelKind, ref_freq, set_kernel_kind
 from helpers.kernels import get_kernel_and_denom
@@ -154,6 +154,18 @@ ALL_METHODS: Dict[str, dict] = {
         "buffer": 0,
         "sr_factor": 1,
     },
+    "nwkr_gaussian_first_start": {
+        "mode": "nwkr_first_start",
+        "family": "optimized",
+        "kernel_kind": "gaussian",
+        "which": "unmasked_varlen",
+    },
+    "nwkr_laplace_first_start": {
+        "mode": "nwkr_first_start",
+        "family": "optimized",
+        "kernel_kind": "laplace",
+        "which": "unmasked_varlen",
+    },
     "ruptures_kernelcpd": {
         "mode": "kernelcpd_rbf_c",
         "min_size": 5,
@@ -164,10 +176,10 @@ ALL_METHODS: Dict[str, dict] = {
         "m": None,
         "ignore_trivial": True,
     },
-    "kats_cusum": {
-        "mode": "kats_cusum",
-        "alpha": 0.01,
-    },
+    # "kats_cusum": {
+    #     "mode": "kats_cusum",
+    #     "alpha": 0.01,
+    # },
     "bocpd": {
         "mode": "bocpd",
         "hazard_lambda": 50.0,
@@ -193,6 +205,24 @@ ALL_METHODS: Dict[str, dict] = {
         "min_seg_len":      2,
     },
 }
+
+# --- Fast NWKR-background change-point baseline ------------------------------
+try:
+    from helpers.cpd_nwkr import CPDF_METHODS as _CPDF_METHODS
+    ALL_METHODS.update(_CPDF_METHODS)
+except Exception as _cpdf_exc:  # pragma: no cover
+    logging.getLogger(__name__).debug("cpdf baselines unavailable: %s", _cpdf_exc)
+
+# --- Deep / OOD baselines (TSB-AD, DeepOD) ------------------------------------
+# Optional: only registered if the adapter module imports cleanly, so the file
+# still works in environments without torch installed.
+try:
+    from helpers.deep_baselines import DEEP_METHODS as _DEEP_METHODS
+    ALL_METHODS.update(_DEEP_METHODS)
+    _DEEP_METHOD_KEYS = set(_DEEP_METHODS)
+except Exception as _deep_exc:  # pragma: no cover
+    _DEEP_METHOD_KEYS = set()
+    logging.getLogger(__name__).debug("deep baselines unavailable: %s", _deep_exc)
 
 # Methods that are known to be very slow and need a hard timeout guard
 _NAIVE_METHODS = {"nwkr_gaussian_naive", "nwkr_laplace_naive"}
@@ -369,7 +399,7 @@ def _make_nwkr_params(
         freq_step = float(ref_freq) / float(max(1, W))
         freqs = np.arange(x.size, dtype=np.float64) * freq_step
     set_kernel_kind(kernel_kind)
-    # params = (0, x, [], [], freqs, buffer, sr_factor, W, R, W, False, True, False)
+    # params = (0, x, [], [], freqs, buffer, sr_factor, None, None, None, False, True, False)
     params = (0, x, [], [], freqs, buffer, sr_factor, W, R, 2*W, False, True, False)
     return params
 
@@ -407,10 +437,13 @@ def scan_row_nwkr(
     if x.size == 0:
         return -np.inf, (0, 0)
     x_2d     = x.reshape(1, -1)
-    freqs_2d = freqs.reshape(1, -1)
-
     x_sr     = superresolve(x_2d,     factor=sr_factor)[0]
-    freqs_sr = superresolve(freqs_2d, factor=sr_factor)[0]
+
+    if freqs is not None:
+        freqs_2d = freqs.reshape(1, -1)
+        freqs_sr = superresolve(freqs_2d, factor=sr_factor)[0]
+    else:
+        freqs_sr = freqs
     params = _make_nwkr_params(x_sr, freqs_sr, W, R, kernel_kind, which, buffer // sr_factor, sr_factor, naive)
     fn = scan_row_with_nwkr_naive if naive else scan_row_with_nwkr
     out = fn(params)
@@ -463,7 +496,10 @@ def scan_row_kernelcpd(
         return 0.0, (0, -1)
 
     signal = x.reshape(-1, 1)
-    algo = rpt.Dynp(model=model, min_size=int(min_size), jump=1).fit(signal)
+    algo = rpt.KernelCPD(kernel="linear", min_size=int(min_size), jump=1).fit(signal)
+    # gamma = 1.0 / max(float(W), 1e-12)
+    # algo = rpt.KernelCPD(kernel="rbf", min_size=int(min_size),
+    #                      jump=1, params={"gamma": gamma}).fit(signal)
 
     best_score = -np.inf
     best_ab    = (0, -1)
@@ -574,120 +610,120 @@ def scan_row_stumpy(
         return 0.0, (0, -1)
     return float(best_score), best_ab
 
-def scan_row_kats_cusum(
-    x: np.ndarray, W: int,
-    alpha: float = 0.01,
-    detrend_deg: Optional[int] = 1,
-) -> Tuple[float, Tuple[int, int]]:
-    """
-    Two-CUSUM epidemic detector with NWKR-comparable score.
+# def scan_row_kats_cusum(
+#     x: np.ndarray, W: int,
+#     alpha: float = 0.01,
+#     detrend_deg: Optional[int] = 1,
+# ) -> Tuple[float, Tuple[int, int]]:
+#     """
+#     Two-CUSUM epidemic detector with NWKR-comparable score.
 
-    Original problem: CUSUMDetector finds a single permanent change-point,
-    which is wrong for epidemic (temporary excursion) detection.
+#     Original problem: CUSUMDetector finds a single permanent change-point,
+#     which is wrong for epidemic (temporary excursion) detection.
 
-    Fix: run a forward CUSUM to find the start of the excursion, then run
-    a backward CUSUM on the segment after the start to find the end.  This
-    gives a (start, end) pair that defines the epidemic interval.  Score
-    with _epidemic_score for comparability with NWKR.
+#     Fix: run a forward CUSUM to find the start of the excursion, then run
+#     a backward CUSUM on the segment after the start to find the end.  This
+#     gives a (start, end) pair that defines the epidemic interval.  Score
+#     with _epidemic_score for comparability with NWKR.
 
-    If Kats CUSUM finds no change-point, fall back to scanning all windows
-    of width W with _epidemic_score and returning the best (same as the mean
-    family baseline).
-    """
-    x = np.asarray(x, dtype=np.float64)
-    n = x.size
-    if n < 10 or W < 2:
-        return 0.0, (0, -1)
+#     If Kats CUSUM finds no change-point, fall back to scanning all windows
+#     of width W with _epidemic_score and returning the best (same as the mean
+#     family baseline).
+#     """
+#     x = np.asarray(x, dtype=np.float64)
+#     n = x.size
+#     if n < 10 or W < 2:
+#         return 0.0, (0, -1)
 
-    if detrend_deg is not None:
-        t  = np.arange(n, dtype=np.float64)
-        x0 = x - np.polyval(np.polyfit(t, x, detrend_deg), t)
-    else:
-        x0 = x.copy()
+#     if detrend_deg is not None:
+#         t  = np.arange(n, dtype=np.float64)
+#         x0 = x - np.polyval(np.polyfit(t, x, detrend_deg), t)
+#     else:
+#         x0 = x.copy()
 
-    def _kats_cp(arr: np.ndarray) -> Optional[int]:
-        """Run CUSUMDetector on arr, return change-point index or None."""
-        try:
-            tt  = pd.date_range("2000-01-01", periods=len(arr), freq="s")
-            ts  = TimeSeriesData(pd.DataFrame({"time": tt, "value": arr}))
-            det = CUSUMDetector(ts)
-            res = det.detector(alpha=alpha)
-            items = res if isinstance(res, (list, tuple)) else ([res] if res is not None else [])
-            for item in items:
-                if item is None:
-                    continue
-                # Try known attribute names across Kats versions
-                for attr in ("cp_index", "cp", "changepoint", "change_point", "start_time"):
-                    if hasattr(item, attr):
-                        v = getattr(item, attr)
-                        if isinstance(v, (int, np.integer)):
-                            return int(v)
-                        # Timestamp — map back to index
-                        try:
-                            v = pd.to_datetime(v)
-                            return int(np.argmin(np.abs((tt - v).to_numpy(
-                                dtype="timedelta64[ns]").astype(np.int64))))
-                        except Exception:
-                            pass
-                if isinstance(item, dict):
-                    for key in ("cp_index", "cp", "changepoint", "change_point"):
-                        if key in item:
-                            v = item[key]
-                            if isinstance(v, (int, np.integer)):
-                                return int(v)
-        except Exception:
-            pass
-        return None
+#     def _kats_cp(arr: np.ndarray) -> Optional[int]:
+#         """Run CUSUMDetector on arr, return change-point index or None."""
+#         try:
+#             tt  = pd.date_range("2000-01-01", periods=len(arr), freq="s")
+#             ts  = TimeSeriesData(pd.DataFrame({"time": tt, "value": arr}))
+#             det = CUSUMDetector(ts)
+#             res = det.detector(alpha=alpha)
+#             items = res if isinstance(res, (list, tuple)) else ([res] if res is not None else [])
+#             for item in items:
+#                 if item is None:
+#                     continue
+#                 # Try known attribute names across Kats versions
+#                 for attr in ("cp_index", "cp", "changepoint", "change_point", "start_time"):
+#                     if hasattr(item, attr):
+#                         v = getattr(item, attr)
+#                         if isinstance(v, (int, np.integer)):
+#                             return int(v)
+#                         # Timestamp — map back to index
+#                         try:
+#                             v = pd.to_datetime(v)
+#                             return int(np.argmin(np.abs((tt - v).to_numpy(
+#                                 dtype="timedelta64[ns]").astype(np.int64))))
+#                         except Exception:
+#                             pass
+#                 if isinstance(item, dict):
+#                     for key in ("cp_index", "cp", "changepoint", "change_point"):
+#                         if key in item:
+#                             v = item[key]
+#                             if isinstance(v, (int, np.integer)):
+#                                 return int(v)
+#         except Exception:
+#             pass
+#         return None
 
-    # --- Forward CUSUM: find start of excursion ---
-    tau_start = _kats_cp(x0)
+#     # --- Forward CUSUM: find start of excursion ---
+#     tau_start = _kats_cp(x0)
 
-    if tau_start is not None:
-        tau_start = int(np.clip(tau_start, 1, n - 2))
+#     if tau_start is not None:
+#         tau_start = int(np.clip(tau_start, 1, n - 2))
 
-        # --- Backward CUSUM on the segment after tau_start: find end ---
-        # Run on the reversed tail so that a rising edge in the forward
-        # signal appears as a falling edge (detectable) in the reversed one.
-        tail     = x0[tau_start:]
-        tau_rel  = _kats_cp(tail[::-1])
+#         # --- Backward CUSUM on the segment after tau_start: find end ---
+#         # Run on the reversed tail so that a rising edge in the forward
+#         # signal appears as a falling edge (detectable) in the reversed one.
+#         tail     = x0[tau_start:]
+#         tau_rel  = _kats_cp(tail[::-1])
 
-        if tau_rel is not None:
-            tau_end = tau_start + (len(tail) - 1 - int(tau_rel))
-            tau_end = int(np.clip(tau_end, tau_start + 1, n - 1))
-        else:
-            # No end detected — use W as the window length
-            tau_end = min(n - 1, tau_start + W - 1)
+#         if tau_rel is not None:
+#             tau_end = tau_start + (len(tail) - 1 - int(tau_rel))
+#             tau_end = int(np.clip(tau_end, tau_start + 1, n - 1))
+#         else:
+#             # No end detected — use W as the window length
+#             tau_end = min(n - 1, tau_start + W - 1)
 
-        # Enforce W constraint
-        if tau_end - tau_start + 1 > W:
-            tau_end = tau_start + W - 1
+#         # Enforce W constraint
+#         if tau_end - tau_start + 1 > W:
+#             tau_end = tau_start + W - 1
 
-        a, b = tau_start, tau_end
+#         a, b = tau_start, tau_end
 
-    else:
-        # CUSUM found nothing — fall back to best mean-score window of width W
-        # (equivalent to the mean baseline scanner)
-        best_sc = -np.inf
-        a = b = 0
-        ps = np.empty(n + 1); ps[0] = 0.0; ps[1:] = np.cumsum(x0)
-        ps2 = np.empty(n + 1); ps2[0] = 0.0; ps2[1:] = np.cumsum(x0 ** 2)
-        mu_all = x0.mean()
-        sra    = float(np.sum((x0 - mu_all) ** 2))
-        if sra < 1e-18:
-            return 0.0, (0, -1)
-        for aa in range(n - 1):
-            bb = min(n - 1, aa + W - 1)
-            if bb <= aa:
-                continue
-            sc = _epidemic_score(x, aa, bb)
-            if sc > best_sc:
-                best_sc = sc; a = aa; b = bb
+#     else:
+#         # CUSUM found nothing — fall back to best mean-score window of width W
+#         # (equivalent to the mean baseline scanner)
+#         best_sc = -np.inf
+#         a = b = 0
+#         ps = np.empty(n + 1); ps[0] = 0.0; ps[1:] = np.cumsum(x0)
+#         ps2 = np.empty(n + 1); ps2[0] = 0.0; ps2[1:] = np.cumsum(x0 ** 2)
+#         mu_all = x0.mean()
+#         sra    = float(np.sum((x0 - mu_all) ** 2))
+#         if sra < 1e-18:
+#             return 0.0, (0, -1)
+#         for aa in range(n - 1):
+#             bb = min(n - 1, aa + W - 1)
+#             if bb <= aa:
+#                 continue
+#             sc = _epidemic_score(x, aa, bb)
+#             if sc > best_sc:
+#                 best_sc = sc; a = aa; b = bb
 
-    if b <= a:
-        return 0.0, (0, -1)
+#     if b <= a:
+#         return 0.0, (0, -1)
 
-    # Score on original signal (not detrended) for fair comparison
-    return float(_epidemic_score(x, a, b)), (a, b)
+#     # Score on original signal (not detrended) for fair comparison
+#     return float(_epidemic_score(x, a, b)), (a, b)
 
 def scan_row_bocpd(
     x: np.ndarray, W: int,
@@ -1259,17 +1295,29 @@ def _run_one(x: np.ndarray, freqs: np.ndarray, W: int, R: int, cfg: dict) -> Tup
     if mode == "nwkr":
         naive = cfg.get("family", "optimized") == "naive"
         n     = x.size
-        # sr_factor = max(1, 2 ** math.ceil(math.log2(max(1, math.ceil((n + 1) / 450)))))
+        sr_factor = max(1, 2 ** math.ceil(math.log2(max(1, math.ceil((n + 1) / 450)))))
+
         return scan_row_nwkr(
             x, freqs=freqs, W=W, R=R,
             kernel_kind=cfg.get("kernel_kind", "gaussian"),
             which=cfg.get("which", "unmasked_varlen"),
-            # buffer=int(len(x)//20),
-            # sr_factor=sr_factor,
-            buffer=cfg.get("buffer", int(n//20)),
-            sr_factor=cfg.get("sr_factor", max(1, 2 ** math.ceil(math.log2(max(1, math.ceil((n + 1) / 450)))))),
+            buffer=int(len(x)//20),
+            sr_factor=sr_factor,
+            # buffer=cfg.get("buffer", int(n//20)),
+            # sr_factor=cfg.get("sr_factor", max(1, 2 ** math.ceil(math.log2(max(1, math.ceil((n + 1) / 450)))))),
             naive=naive,
         )
+
+    if mode == "nwkr_first_start":
+        from helpers.scan import set_fix_first_start
+        set_fix_first_start(True)
+        try:
+            sub = dict(cfg); sub["mode"] = "nwkr"
+            if not freqs:
+                freqs_rt = np.linspace(220e9, 224e9, len(x))
+            return _run_one(x, freqs_rt, W, R, sub)
+        finally:
+            set_fix_first_start(False)
 
     if mode == "kernelcpd_rbf_c":
         return scan_row_kernelcpd(
@@ -1315,6 +1363,50 @@ def _run_one(x: np.ndarray, freqs: np.ndarray, W: int, R: int, cfg: dict) -> Tup
             beta_prime_scale = float(cfg.get("beta_prime_scale", 3.0)),
             min_seg_len      = int(cfg.get("min_seg_len",         2)),
         )
+
+    if mode == "cpdf":
+        from helpers.cpd_nwkr import scan_row_cpd_fast
+        from helpers.config import ref_freq
+        fkw = dict(cfg.get("family_kwargs", {}))
+        if str(cfg.get("family", "")).startswith("nwkr"):
+            if freqs is not None and len(freqs) > 1:
+                freq_step = abs(freqs[1] - freqs[0])
+                L = len(freqs)
+                R = ref_freq / (freq_step if freq_step > 0 else 1.)
+                w_auto = int(round(max(3, min(R, L / 16))))
+            else:
+                w_auto = int(cfg.get("w", W))
+            fkw["w"] = float(cfg.get("w", w_auto))
+            width_cap = 3 * w_auto
+        else:
+            width_cap = cfg.get("width_cap", None)
+        return scan_row_cpd_fast(
+            x, W,
+            family        = cfg.get("family", "nwkr_gaussian"),
+            family_kwargs = fkw,
+            algo          = cfg.get("algo", "kernelcpd"),
+            min_size      = int(cfg.get("min_size", 3)),
+            n_bkps        = int(cfg.get("n_bkps", 2)),
+            width_cap     = width_cap,
+            jump          = int(cfg.get("jump", 1)),
+        )
+
+    if mode == "deep":
+        from helpers.deep_baselines import scan_row_deep
+        return scan_row_deep(
+            x, W,
+            backend        = cfg.get("backend", "tsbad"),
+            model          = cfg.get("model", "USAD"),
+            seed           = int(cfg.get("seed", 42)),
+            min_width      = int(cfg.get("min_width", 2)),
+            top_k          = int(cfg.get("top_k", 3)),
+            n_widths       = int(cfg.get("n_widths", 24)),
+            refine         = bool(cfg.get("refine", True)),
+            smooth         = int(cfg.get("smooth", 0)),
+            select         = cfg.get("select", "deep"),
+            backend_kwargs = cfg.get("backend_kwargs", None),
+        )
+
 
     raise ValueError(f"Unknown mode {mode!r}")
 
